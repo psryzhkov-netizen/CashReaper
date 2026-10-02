@@ -85,6 +85,7 @@ namespace CashReaper
         private decimal _stopLossPrice;
         private decimal _activeVolume;
         private decimal _entryBasePrice;
+        private decimal _lastKnownPosition;
         private int _lossSeriesStep;
 
         public CashReaperStrategy() : base(true)
@@ -94,6 +95,8 @@ namespace CashReaper
 
         protected override void OnStarted()
         {
+            _lastKnownPosition = CurrentPosition;
+
             if (SkipOldSignalOnStart)
                 _lastProcessedSignalBar = Math.Max(_lastProcessedSignalBar, CurrentBar - 2);
 
@@ -177,14 +180,19 @@ namespace CashReaper
 
             _lastProcessedSignalBar = signalBar;
 
+            SyncPositionState(signalBar, "before_signal_check");
             RecoverAfterConnectionGap(signalBar);
             CheckSignal(signalBar);
+            SyncPositionState(signalBar, "after_signal_check");
         }
 
         protected override void OnOrderChanged(Order order)
         {
             if (order == null)
                 return;
+
+            RecordOrderEvent(order, "order_changed", "atas_order_changed");
+            SyncPositionState(_lastProcessedSignalBar, "order_changed");
 
             if (_entryOrder != null && order.Id == _entryOrder.Id)
             {
@@ -334,12 +342,14 @@ namespace CashReaper
             try
             {
                 OpenOrder(_entryOrder);
+                RecordTradeEvent("entry_order_sent", _lastProcessedSignalBar, _entryDirection.ToString(), true, "open_order_ok", _activeVolume);
 
                 RaiseShowNotification(
                     $"{GetInstanceLabel()}: отправлена входная заявка {direction}; Volume={_activeVolume}");
             }
             catch (Exception ex)
             {
+                RecordTradeEvent("entry_order_error", _lastProcessedSignalBar, _entryDirection.ToString(), false, ex.Message, _activeVolume);
                 ResetTradeState();
                 RaiseShowNotification(
                     $"{GetInstanceLabel()}: входная заявка не отправлена. Состояние сброшено. Ошибка: {ex.Message}");
@@ -349,6 +359,8 @@ namespace CashReaper
         private void HandleEntryFilled()
         {
             _tradeState = TradeState.PositionOpen;
+            _lastKnownPosition = CurrentPosition;
+            RecordTradeEvent("entry_filled", _lastProcessedSignalBar, _entryDirection.ToString(), true, "position_open", Math.Abs(CurrentPosition));
 
             RaiseShowNotification(
                 $"{GetInstanceLabel()}: вход исполнен. Position={CurrentPosition}; TP={_takeProfitPrice}; SL={_stopLossPrice}");
@@ -394,6 +406,14 @@ namespace CashReaper
             _tradeState = _protectiveOrdersSent
                 ? TradeState.ProtectiveOrdersActive
                 : TradeState.PositionOpen;
+
+            RecordTradeEvent(
+                _protectiveOrdersSent ? "protective_orders_active" : "protective_orders_partial",
+                _lastProcessedSignalBar,
+                exitDirection.ToString(),
+                _protectiveOrdersSent,
+                _protectiveOrdersSent ? "tp_sl_sent" : "tp_sl_partial",
+                quantity);
 
             if (!_protectiveOrdersSent)
             {
@@ -460,6 +480,7 @@ namespace CashReaper
             if (signalBar - _entrySentBar < EntryRecoveryBars)
                 return;
 
+            RecordTradeEvent("entry_order_timeout", signalBar, _entryDirection.ToString(), false, "position_not_opened", _activeVolume);
             ResetTradeState();
 
             RaiseShowNotification(
@@ -476,6 +497,7 @@ namespace CashReaper
                 _lossSeriesStep = Math.Min(Math.Max(MaxSeriesStep, 1), _lossSeriesStep + 1);
 
             RecordTradeClosed(outcome);
+            _lastKnownPosition = CurrentPosition;
 
             RaiseShowNotification(
                 $"{GetInstanceLabel()}: позиция закрыта. Outcome={outcome}; NextSeriesStep={_lossSeriesStep}");
@@ -579,10 +601,12 @@ namespace CashReaper
             try
             {
                 OpenOrder(order);
+                RecordOrderEvent(order, $"{orderName}_sent", "open_order_ok");
                 return true;
             }
             catch (Exception ex)
             {
+                RecordOrderEvent(order, $"{orderName}_error", ex.Message);
                 RaiseShowNotification(
                     $"{GetInstanceLabel()}: не удалось отправить {orderName}. Ошибка: {ex.Message}");
 
@@ -614,6 +638,32 @@ namespace CashReaper
             }
         }
 
+        private void SyncPositionState(int bar, string reason)
+        {
+            if (CurrentPosition == _lastKnownPosition)
+                return;
+
+            var previousPosition = _lastKnownPosition;
+            _lastKnownPosition = CurrentPosition;
+
+            RecordTradeEvent(
+                "position_changed",
+                bar,
+                CurrentPosition > 0 ? OrderDirections.Buy.ToString() : CurrentPosition < 0 ? OrderDirections.Sell.ToString() : _entryDirection.ToString(),
+                true,
+                $"{reason}; previous={previousPosition}; current={CurrentPosition}",
+                Math.Abs(CurrentPosition));
+
+            if (previousPosition == 0 && CurrentPosition != 0 && _entrySent && !_protectiveOrdersSent)
+            {
+                HandleEntryFilled();
+                return;
+            }
+
+            if (previousPosition != 0 && CurrentPosition == 0 && _entrySent)
+                HandleTradeClosed(reason);
+        }
+
         private void ResetTradeState()
         {
             _entryOrder = null;
@@ -627,6 +677,7 @@ namespace CashReaper
             _tradingStoppedByTime = false;
             _entrySentBar = -1;
             _lastProtectiveRetryBar = -1;
+            _lastKnownPosition = CurrentPosition;
 
             _takeProfitPrice = 0;
             _stopLossPrice = 0;
@@ -751,6 +802,49 @@ namespace CashReaper
                 0m,
                 false,
                 _activeVolume);
+        }
+
+        private void RecordTradeEvent(
+            string eventType,
+            int bar,
+            string direction,
+            bool accepted,
+            string reason,
+            decimal volume)
+        {
+            if (!StatisticsCollectorEnabled)
+                return;
+
+            WriteStatsLine(
+                eventType,
+                bar,
+                "",
+                accepted,
+                reason,
+                direction,
+                0m,
+                0m,
+                0m,
+                _entryBasePrice,
+                0m,
+                0m,
+                0m,
+                false,
+                volume);
+        }
+
+        private void RecordOrderEvent(Order order, string eventType, string reason)
+        {
+            if (!StatisticsCollectorEnabled || order == null)
+                return;
+
+            RecordTradeEvent(
+                eventType,
+                _lastProcessedSignalBar,
+                order.Direction.ToString(),
+                eventType.IndexOf("error", StringComparison.OrdinalIgnoreCase) < 0,
+                reason,
+                order.QuantityToFill);
         }
 
         private void WriteStatsLine(
