@@ -1,4 +1,6 @@
 using System;
+using System.Globalization;
+using System.IO;
 using ATAS.DataFeedsCore;
 using ATAS.Strategies.Chart;
 
@@ -20,19 +22,40 @@ namespace CashReaper
         public bool SkipOldSignalOnStart { get; set; } = true;
         public bool RestoreProtectiveOrdersOnStart { get; set; } = true;
         public bool TradingTimeLimitEnabled { get; set; } = false;
+        public bool StatisticsCollectorEnabled { get; set; } = false;
+        public bool RiskSizingEnabled { get; set; } = false;
+        public bool SeriesSizingEnabled { get; set; } = false;
 
         public int EntryRecoveryBars { get; set; } = 3;
         public int ProtectiveRetryBars { get; set; } = 1;
         public int TradingStopHour { get; set; } = 23;
         public int TradingStopMinute { get; set; } = 59;
+        public int RangeSize { get; set; } = 5;
+        public int ProtectionCalculationMode { get; set; } = 0;
+        public int SeriesSizingMode { get; set; } = 0;
+        public int MaxSeriesStep { get; set; } = 4;
 
         public int FastPeriod { get; set; } = 12;
         public int SlowPeriod { get; set; } = 26;
         public int SignalPeriod { get; set; } = 9;
 
         public decimal Volume { get; set; } = 0.001m;
+        public decimal MinVolume { get; set; } = 0.001m;
+        public decimal MaxVolume { get; set; } = 0m;
+        public decimal VolumeStep { get; set; } = 0.001m;
         public decimal TakeProfitPoints { get; set; } = 400m;
         public decimal StopLossPoints { get; set; } = 200m;
+        public decimal TakeProfitPricePercent { get; set; } = 0.5m;
+        public decimal StopLossPricePercent { get; set; } = 0.25m;
+        public decimal TakeProfitDepositPercent { get; set; } = 1m;
+        public decimal StopLossDepositPercent { get; set; } = 0.5m;
+        public decimal DepositReferenceValue { get; set; } = 0m;
+        public decimal RiskPerTradeDepositPercent { get; set; } = 1m;
+        public decimal PointValue { get; set; } = 1m;
+        public decimal CommissionPerContract { get; set; } = 0m;
+        public decimal CommissionPercent { get; set; } = 0m;
+
+        public string StatisticsFileName { get; set; } = "CashReaperStats.csv";
 
         private decimal[] _fastEma = Array.Empty<decimal>();
         private decimal[] _slowEma = Array.Empty<decimal>();
@@ -60,6 +83,9 @@ namespace CashReaper
 
         private decimal _takeProfitPrice;
         private decimal _stopLossPrice;
+        private decimal _activeVolume;
+        private decimal _entryBasePrice;
+        private int _lossSeriesStep;
 
         public CashReaperStrategy() : base(true)
         {
@@ -92,8 +118,8 @@ namespace CashReaper
 
             RaiseShowNotification(
                 TradingEnabled
-                    ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; TimeLimit={TradingTimeLimitEnabled}; StopTime={GetStopTimeText()}"
-                    : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; TimeLimit={TradingTimeLimitEnabled}; StopTime={GetStopTimeText()}");
+                    ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; TimeLimit={TradingTimeLimitEnabled}; StopTime={GetStopTimeText()}; Collector={StatisticsCollectorEnabled}"
+                    : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; TimeLimit={TradingTimeLimitEnabled}; StopTime={GetStopTimeText()}; Collector={StatisticsCollectorEnabled}");
         }
 
         protected override void OnStopping()
@@ -168,6 +194,18 @@ namespace CashReaper
                 return;
             }
 
+            if (_takeProfitOrder != null && order.Id == _takeProfitOrder.Id && CurrentPosition == 0)
+            {
+                HandleTradeClosed("TP");
+                return;
+            }
+
+            if (_stopLossOrder != null && order.Id == _stopLossOrder.Id && CurrentPosition == 0)
+            {
+                HandleTradeClosed("SL");
+                return;
+            }
+
             if (CurrentPosition != 0 && _entrySent && !_protectiveOrdersSent)
             {
                 RaiseDebug("Позиция есть, но защитные заявки ещё не активны. Проверяю защиту.");
@@ -177,11 +215,7 @@ namespace CashReaper
 
             if (CurrentPosition == 0 && _entrySent && _protectiveOrdersSent)
             {
-                CancelProtectiveOrders();
-
-                RaiseShowNotification($"{GetInstanceLabel()}: позиция закрыта.");
-
-                ResetTradeState();
+                HandleTradeClosed("unknown");
             }
         }
 
@@ -195,7 +229,10 @@ namespace CashReaper
             }
 
             if (!IsTradingTimeAllowed(bar))
+            {
+                RecordBarDecision(bar, null, null, 0, false, "", false, "time_limit");
                 return;
+            }
 
             var previous = GetCandle(bar - 1);
             var current = GetCandle(bar);
@@ -221,15 +258,21 @@ namespace CashReaper
 
             if (isLong)
             {
+                RecordBarDecision(bar, current, previous, diff, engulf, "LONG", true, "accepted");
                 ProcessSignal(OrderDirections.Buy, "LONG", bar, diff);
                 return;
             }
 
             if (isShort)
             {
+                RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", true, "accepted");
                 ProcessSignal(OrderDirections.Sell, "SHORT", bar, diff);
                 return;
             }
+
+            var rejectReason = GetRejectReason(currentBullish, currentBearish, previousBullish, previousBearish, engulf, diff);
+
+            RecordBarDecision(bar, current, previous, diff, engulf, "", false, rejectReason);
 
             RaiseDebug(
                 $"Сигнала нет. Bar={bar}; CurrentBull={currentBullish}; CurrentBear={currentBearish}; PreviousBull={previousBullish}; PreviousBear={previousBearish}; Engulf={engulf}; Diff={diff}");
@@ -240,20 +283,29 @@ namespace CashReaper
             var signalCandle = GetCandle(bar);
 
             _entryDirection = direction;
-            CalculateProtectionPrices(signalCandle.Close, direction);
+            _entryBasePrice = signalCandle.Close;
+            CalculateProtectionPrices(_entryBasePrice, direction, Volume);
+
+            var stopDistance = Math.Abs(_entryBasePrice - _stopLossPrice);
+            _activeVolume = CalculateOrderVolume(stopDistance);
+
+            CalculateProtectionPrices(_entryBasePrice, direction, _activeVolume);
 
             var message =
                 $"{GetInstanceLabel()}: {signalName} signal. " +
                 $"Bar={bar}; " +
                 $"Close={signalCandle.Close}; " +
                 $"Difference={diff}; " +
-                $"Volume={Volume}; " +
+                $"Volume={_activeVolume}; " +
                 $"TP={_takeProfitPrice}; " +
                 $"SL={_stopLossPrice}; " +
                 $"TPPoints={TakeProfitPoints}; " +
-                $"SLPoints={StopLossPoints}";
+                $"SLPoints={StopLossPoints}; " +
+                $"ProtectionMode={ProtectionCalculationMode}; " +
+                $"SeriesStep={_lossSeriesStep}";
 
             RaiseShowNotification(message);
+            RecordSignal(bar, signalName, signalCandle.Close, diff, _activeVolume, "signal");
 
             if (!TradingEnabled)
             {
@@ -272,7 +324,7 @@ namespace CashReaper
                 Security = Security,
                 Direction = direction,
                 Type = OrderTypes.Market,
-                QuantityToFill = Volume
+                QuantityToFill = _activeVolume
             };
 
             _entrySent = true;
@@ -284,7 +336,7 @@ namespace CashReaper
                 OpenOrder(_entryOrder);
 
                 RaiseShowNotification(
-                    $"{GetInstanceLabel()}: отправлена входная заявка {direction}; Volume={Volume}");
+                    $"{GetInstanceLabel()}: отправлена входная заявка {direction}; Volume={_activeVolume}");
             }
             catch (Exception ex)
             {
@@ -361,11 +413,13 @@ namespace CashReaper
 
             _entrySent = true;
             _entrySentBar = bar;
+            _activeVolume = Math.Abs(CurrentPosition);
+            _entryBasePrice = candle.Close;
             _entryDirection = CurrentPosition > 0
                 ? OrderDirections.Buy
                 : OrderDirections.Sell;
 
-            CalculateProtectionPrices(candle.Close, _entryDirection);
+            CalculateProtectionPrices(candle.Close, _entryDirection, _activeVolume);
 
             RaiseShowNotification(
                 $"{GetInstanceLabel()}: восстановление сопровождения открытой позиции. BasePrice={candle.Close}; TP={_takeProfitPrice}; SL={_stopLossPrice}");
@@ -393,12 +447,10 @@ namespace CashReaper
 
             if (CurrentPosition == 0 && _tradeState == TradeState.ProtectiveOrdersActive)
             {
-                CancelProtectiveOrders();
-
                 RaiseShowNotification(
                     $"{GetInstanceLabel()}: позиция закрыта после восстановления связи. Состояние сброшено.");
 
-                ResetTradeState();
+                HandleTradeClosed("unknown");
                 return;
             }
 
@@ -414,18 +466,105 @@ namespace CashReaper
                 $"{GetInstanceLabel()}: восстановление после разрыва или отклонённой заявки. Позиции нет, состояние сброшено, новые сигналы разрешены.");
         }
 
-        private void CalculateProtectionPrices(decimal basePrice, OrderDirections direction)
+        private void HandleTradeClosed(string outcome)
         {
+            CancelProtectiveOrders();
+
+            if (outcome == "TP")
+                _lossSeriesStep = 0;
+            else if (outcome == "SL")
+                _lossSeriesStep = Math.Min(Math.Max(MaxSeriesStep, 1), _lossSeriesStep + 1);
+
+            RecordTradeClosed(outcome);
+
+            RaiseShowNotification(
+                $"{GetInstanceLabel()}: позиция закрыта. Outcome={outcome}; NextSeriesStep={_lossSeriesStep}");
+
+            ResetTradeState();
+        }
+
+        private void CalculateProtectionPrices(decimal basePrice, OrderDirections direction, decimal orderVolume)
+        {
+            var takeDistance = CalculateTakeProfitDistance(basePrice, orderVolume);
+            var stopDistance = CalculateStopLossDistance(basePrice, orderVolume);
+
             if (direction == OrderDirections.Buy)
             {
-                _stopLossPrice = basePrice - StopLossPoints;
-                _takeProfitPrice = basePrice + TakeProfitPoints;
+                _stopLossPrice = basePrice - stopDistance;
+                _takeProfitPrice = basePrice + takeDistance;
             }
             else
             {
-                _stopLossPrice = basePrice + StopLossPoints;
-                _takeProfitPrice = basePrice - TakeProfitPoints;
+                _stopLossPrice = basePrice + stopDistance;
+                _takeProfitPrice = basePrice - takeDistance;
             }
+        }
+
+        private decimal CalculateTakeProfitDistance(decimal basePrice, decimal orderVolume)
+        {
+            if (ProtectionCalculationMode == 1)
+                return Math.Abs(basePrice) * TakeProfitPricePercent / 100m;
+
+            if (ProtectionCalculationMode == 2 && DepositReferenceValue > 0 && PointValue > 0 && orderVolume > 0)
+                return DepositReferenceValue * TakeProfitDepositPercent / 100m / (orderVolume * PointValue);
+
+            return TakeProfitPoints;
+        }
+
+        private decimal CalculateStopLossDistance(decimal basePrice, decimal orderVolume)
+        {
+            if (ProtectionCalculationMode == 1)
+                return Math.Abs(basePrice) * StopLossPricePercent / 100m;
+
+            if (ProtectionCalculationMode == 2 && DepositReferenceValue > 0 && PointValue > 0 && orderVolume > 0)
+                return DepositReferenceValue * StopLossDepositPercent / 100m / (orderVolume * PointValue);
+
+            return StopLossPoints;
+        }
+
+        private decimal CalculateOrderVolume(decimal stopDistance)
+        {
+            var baseVolume = Volume;
+
+            if (RiskSizingEnabled && DepositReferenceValue > 0 && RiskPerTradeDepositPercent > 0 && PointValue > 0 && stopDistance > 0)
+            {
+                var riskMoney = DepositReferenceValue * RiskPerTradeDepositPercent / 100m;
+                baseVolume = riskMoney / (stopDistance * PointValue);
+            }
+
+            if (SeriesSizingEnabled)
+                baseVolume *= GetSeriesMultiplier();
+
+            return NormalizeVolume(baseVolume);
+        }
+
+        private decimal GetSeriesMultiplier()
+        {
+            if (_lossSeriesStep <= 0)
+                return 1m;
+
+            var step = Math.Min(_lossSeriesStep, Math.Max(MaxSeriesStep, 1));
+
+            if (SeriesSizingMode == 2)
+                return (decimal)Math.Pow(2, step);
+
+            return 1m + step;
+        }
+
+        private decimal NormalizeVolume(decimal value)
+        {
+            var volume = value;
+
+            if (VolumeStep > 0)
+                volume = Math.Floor(volume / VolumeStep) * VolumeStep;
+
+            if (volume < MinVolume)
+                volume = MinVolume;
+
+            if (MaxVolume > 0 && volume > MaxVolume)
+                volume = MaxVolume;
+
+            return volume;
         }
 
         private OrderDirections GetExitDirectionForCurrentPosition()
@@ -499,6 +638,214 @@ namespace CashReaper
                 return;
 
             RaiseShowNotification($"{GetInstanceLabel()}: DEBUG: {message}");
+        }
+
+        private string GetRejectReason(
+            bool currentBullish,
+            bool currentBearish,
+            bool previousBullish,
+            bool previousBearish,
+            bool engulf,
+            decimal diff)
+        {
+            if (!engulf)
+                return "no_body_engulf";
+
+            if (diff == 0)
+                return "macd_zero";
+
+            if (currentBullish && previousBearish && diff <= 0)
+                return "long_macd_filter";
+
+            if (currentBearish && previousBullish && diff >= 0)
+                return "short_macd_filter";
+
+            if (!currentBullish && !currentBearish)
+                return "doji_current";
+
+            if (!previousBullish && !previousBearish)
+                return "doji_previous";
+
+            return "bar_direction_filter";
+        }
+
+        private void RecordBarDecision(
+            int bar,
+            dynamic current,
+            dynamic previous,
+            decimal diff,
+            bool engulf,
+            string signalName,
+            bool accepted,
+            string reason)
+        {
+            if (!StatisticsCollectorEnabled)
+                return;
+
+            var close = current == null ? 0m : current.Close;
+            var open = current == null ? 0m : current.Open;
+            var high = current == null ? 0m : current.High;
+            var low = current == null ? 0m : current.Low;
+            var body = Math.Abs(close - open);
+            var range = Math.Abs(high - low);
+
+            WriteStatsLine(
+                "bar",
+                bar,
+                signalName,
+                accepted,
+                reason,
+                "",
+                open,
+                high,
+                low,
+                close,
+                body,
+                range,
+                diff,
+                engulf,
+                0m);
+        }
+
+        private void RecordSignal(int bar, string signalName, decimal close, decimal diff, decimal volume, string reason)
+        {
+            if (!StatisticsCollectorEnabled)
+                return;
+
+            WriteStatsLine(
+                "signal",
+                bar,
+                signalName,
+                true,
+                reason,
+                _entryDirection.ToString(),
+                0m,
+                0m,
+                0m,
+                close,
+                0m,
+                0m,
+                diff,
+                true,
+                volume);
+        }
+
+        private void RecordTradeClosed(string outcome)
+        {
+            if (!StatisticsCollectorEnabled)
+                return;
+
+            WriteStatsLine(
+                "trade_closed",
+                _lastProcessedSignalBar,
+                "",
+                true,
+                outcome,
+                _entryDirection.ToString(),
+                0m,
+                0m,
+                0m,
+                0m,
+                0m,
+                0m,
+                0m,
+                false,
+                _activeVolume);
+        }
+
+        private void WriteStatsLine(
+            string eventType,
+            int bar,
+            string signalName,
+            bool accepted,
+            string reason,
+            string direction,
+            decimal open,
+            decimal high,
+            decimal low,
+            decimal close,
+            decimal body,
+            decimal range,
+            decimal diff,
+            bool engulf,
+            decimal volume)
+        {
+            try
+            {
+                var path = GetStatisticsPath();
+                var fileExists = File.Exists(path);
+
+                using (var writer = new StreamWriter(path, append: true))
+                {
+                    if (!fileExists)
+                        writer.WriteLine(GetStatisticsHeader());
+
+                    writer.WriteLine(string.Join(",",
+                        Csv(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)),
+                        Csv(GetInstanceLabel()),
+                        Csv(Security == null ? "" : Security.ToString()),
+                        Csv(eventType),
+                        Csv(bar.ToString(CultureInfo.InvariantCulture)),
+                        Csv(_tradeState.ToString()),
+                        Csv(open),
+                        Csv(high),
+                        Csv(low),
+                        Csv(close),
+                        Csv(body),
+                        Csv(range),
+                        Csv(diff),
+                        Csv(engulf),
+                        Csv(signalName),
+                        Csv(direction),
+                        Csv(accepted),
+                        Csv(reason),
+                        Csv(volume),
+                        Csv(_takeProfitPrice),
+                        Csv(_stopLossPrice),
+                        Csv(TakeProfitPoints),
+                        Csv(StopLossPoints),
+                        Csv(ProtectionCalculationMode),
+                        Csv(_lossSeriesStep),
+                        Csv(RangeSize),
+                        Csv(CommissionPerContract),
+                        Csv(CommissionPercent),
+                        Csv(""),
+                        Csv(""),
+                        Csv(""),
+                        Csv("")));
+                }
+            }
+            catch (Exception ex)
+            {
+                RaiseDebug($"Statistics Collector error: {ex.Message}");
+            }
+        }
+
+        private string GetStatisticsHeader()
+        {
+            return "time,instance,instrument,event,bar,state,open,high,low,close,body,range,macd_difference,body_engulf,signal,direction,accepted,reason,volume,tp,sl,tp_points,sl_points,protection_mode,series_step,range_size,commission_per_contract,commission_percent,delta,delta_volume,cvd,imbalance";
+        }
+
+        private string GetStatisticsPath()
+        {
+            var directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "CashReaper");
+
+            Directory.CreateDirectory(directory);
+
+            var fileName = string.IsNullOrWhiteSpace(StatisticsFileName)
+                ? "CashReaperStats.csv"
+                : StatisticsFileName;
+
+            return Path.Combine(directory, fileName);
+        }
+
+        private string Csv(object value)
+        {
+            var text = Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
+            text = text.Replace("\"", "\"\"");
+            return $"\"{text}\"";
         }
 
         private bool IsTradingTimeAllowed(int bar)
