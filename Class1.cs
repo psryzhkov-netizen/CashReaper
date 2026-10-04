@@ -1,4 +1,5 @@
 using System;
+using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.IO;
 using ATAS.DataFeedsCore;
@@ -16,45 +17,134 @@ namespace CashReaper
             ProtectiveOrdersActive
         }
 
+        public enum ProtectionMode
+        {
+            Points = 0,
+            PricePercent = 1,
+            DepositPercent = 2
+        }
+
+        public enum SeriesMode
+        {
+            Linear = 1,
+            Martingale = 2
+        }
+
+        [Display(GroupName = "01. Trading", Name = "Enable trading", Order = 10)]
         public bool TradingEnabled { get; set; } = false;
-        public bool DebugMode { get; set; } = false;
-        public bool AutoRecoveryEnabled { get; set; } = true;
-        public bool SkipOldSignalOnStart { get; set; } = true;
-        public bool RestoreProtectiveOrdersOnStart { get; set; } = true;
-        public bool TradingTimeLimitEnabled { get; set; } = false;
+
+        [Display(GroupName = "02. Replay and diagnostics", Name = "Market Replay mode", Order = 20)]
+        public bool MarketReplayMode { get; set; } = true;
+
+        [Display(GroupName = "02. Replay and diagnostics", Name = "Collect CSV statistics", Order = 30)]
         public bool StatisticsCollectorEnabled { get; set; } = false;
+
+        [Display(GroupName = "02. Replay and diagnostics", Name = "Debug notifications", Order = 40)]
+        public bool DebugMode { get; set; } = false;
+
+        [Display(GroupName = "03. Recovery", Name = "Auto recovery", Order = 50)]
+        public bool AutoRecoveryEnabled { get; set; } = true;
+
+        [Display(GroupName = "03. Recovery", Name = "Skip old signal on start", Order = 60)]
+        public bool SkipOldSignalOnStart { get; set; } = true;
+
+        [Display(GroupName = "03. Recovery", Name = "Restore TP/SL on start", Order = 70)]
+        public bool RestoreProtectiveOrdersOnStart { get; set; } = true;
+
+        [Display(GroupName = "04. Time filter", Name = "Use trading pause", Order = 80)]
+        public bool TradingTimeLimitEnabled { get; set; } = false;
+
+        [Display(GroupName = "05. Risk sizing", Name = "Use risk sizing", Order = 120)]
         public bool RiskSizingEnabled { get; set; } = false;
+
+        [Display(GroupName = "06. Series sizing", Name = "Use series sizing", Order = 150)]
         public bool SeriesSizingEnabled { get; set; } = false;
 
+        [Display(GroupName = "03. Recovery", Name = "Entry timeout bars", Order = 90)]
         public int EntryRecoveryBars { get; set; } = 3;
+
+        [Display(GroupName = "03. Recovery", Name = "TP/SL retry bars", Order = 100)]
         public int ProtectiveRetryBars { get; set; } = 1;
-        public int TradingStopHour { get; set; } = 23;
-        public int TradingStopMinute { get; set; } = 59;
+
+        [Display(GroupName = "04. Time filter", Name = "Pause start hour", Order = 110)]
+        public int TradingPauseStartHour { get; set; } = 23;
+
+        [Display(GroupName = "04. Time filter", Name = "Pause start minute", Order = 111)]
+        public int TradingPauseStartMinute { get; set; } = 59;
+
+        [Display(GroupName = "04. Time filter", Name = "Pause end hour", Order = 112)]
+        public int TradingPauseEndHour { get; set; } = 2;
+
+        [Display(GroupName = "04. Time filter", Name = "Pause end minute", Order = 113)]
+        public int TradingPauseEndMinute { get; set; } = 0;
+
+        [Display(GroupName = "07. Signal", Name = "Range size", Order = 200)]
         public int RangeSize { get; set; } = 5;
-        public int ProtectionCalculationMode { get; set; } = 0;
-        public int SeriesSizingMode { get; set; } = 0;
+
+        [Display(GroupName = "08. TP/SL", Name = "TP/SL mode", Order = 250)]
+        public ProtectionMode ProtectionCalculationMode { get; set; } = ProtectionMode.Points;
+
+        [Display(GroupName = "06. Series sizing", Name = "Series mode", Order = 160)]
+        public SeriesMode SeriesSizingMode { get; set; } = SeriesMode.Linear;
+
+        [Display(GroupName = "06. Series sizing", Name = "Max series step", Order = 170)]
         public int MaxSeriesStep { get; set; } = 4;
 
+        [Display(GroupName = "07. Signal", Name = "MACD fast period", Order = 210)]
         public int FastPeriod { get; set; } = 12;
+
+        [Display(GroupName = "07. Signal", Name = "MACD slow period", Order = 220)]
         public int SlowPeriod { get; set; } = 26;
+
+        [Display(GroupName = "07. Signal", Name = "MACD signal period", Order = 230)]
         public int SignalPeriod { get; set; } = 9;
 
+        [Display(GroupName = "01. Trading", Name = "Base volume", Order = 11)]
         public decimal Volume { get; set; } = 0.001m;
+
+        [Display(GroupName = "01. Trading", Name = "Min volume", Order = 12)]
         public decimal MinVolume { get; set; } = 0.001m;
+
+        [Display(GroupName = "01. Trading", Name = "Max volume (0 = off)", Order = 13)]
         public decimal MaxVolume { get; set; } = 0m;
+
+        [Display(GroupName = "01. Trading", Name = "Volume step", Order = 14)]
         public decimal VolumeStep { get; set; } = 0.001m;
+
+        [Display(GroupName = "08. TP/SL", Name = "Take profit points", Order = 260)]
         public decimal TakeProfitPoints { get; set; } = 400m;
+
+        [Display(GroupName = "08. TP/SL", Name = "Stop loss points", Order = 270)]
         public decimal StopLossPoints { get; set; } = 200m;
+
+        [Display(GroupName = "08. TP/SL", Name = "Take profit price %", Order = 280)]
         public decimal TakeProfitPricePercent { get; set; } = 0.5m;
+
+        [Display(GroupName = "08. TP/SL", Name = "Stop loss price %", Order = 290)]
         public decimal StopLossPricePercent { get; set; } = 0.25m;
+
+        [Display(GroupName = "08. TP/SL", Name = "Take profit deposit %", Order = 300)]
         public decimal TakeProfitDepositPercent { get; set; } = 1m;
+
+        [Display(GroupName = "08. TP/SL", Name = "Stop loss deposit %", Order = 310)]
         public decimal StopLossDepositPercent { get; set; } = 0.5m;
+
+        [Display(GroupName = "05. Risk sizing", Name = "Deposit reference", Order = 130)]
         public decimal DepositReferenceValue { get; set; } = 0m;
+
+        [Display(GroupName = "05. Risk sizing", Name = "Risk per trade deposit %", Order = 140)]
         public decimal RiskPerTradeDepositPercent { get; set; } = 1m;
+
+        [Display(GroupName = "05. Risk sizing", Name = "Point value", Order = 141)]
         public decimal PointValue { get; set; } = 1m;
+
+        [Display(GroupName = "09. Commission", Name = "Commission per contract", Order = 350)]
         public decimal CommissionPerContract { get; set; } = 0m;
+
+        [Display(GroupName = "09. Commission", Name = "Commission %", Order = 360)]
         public decimal CommissionPercent { get; set; } = 0m;
 
+        [Display(GroupName = "02. Replay and diagnostics", Name = "CSV file name", Order = 41)]
         public string StatisticsFileName { get; set; } = "CashReaperStats.csv";
 
         private decimal[] _fastEma = Array.Empty<decimal>();
@@ -119,10 +209,20 @@ namespace CashReaper
                     RestoreProtectionForExistingPosition();
             }
 
+            var context = GetTradingContextText();
+
             RaiseShowNotification(
                 TradingEnabled
-                    ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; TimeLimit={TradingTimeLimitEnabled}; StopTime={GetStopTimeText()}; Collector={StatisticsCollectorEnabled}"
-                    : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; TimeLimit={TradingTimeLimitEnabled}; StopTime={GetStopTimeText()}; Collector={StatisticsCollectorEnabled}");
+                    ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}"
+                    : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}");
+
+            RecordTradeEvent(
+                "strategy_started",
+                Math.Max(0, CurrentBar - 1),
+                "",
+                TradingEnabled,
+                context,
+                0m);
         }
 
         protected override void OnStopping()
@@ -227,6 +327,50 @@ namespace CashReaper
             }
         }
 
+        protected override void OnNewMyTrade(MyTrade myTrade)
+        {
+            if (myTrade == null)
+                return;
+
+            RecordTradeEvent(
+                "my_trade",
+                _lastProcessedSignalBar,
+                _entryDirection.ToString(),
+                true,
+                myTrade.ToString(),
+                Math.Abs(CurrentPosition));
+
+            SyncPositionState(_lastProcessedSignalBar, "my_trade");
+        }
+
+        protected override void OnOrderRegisterFailed(Order order, string message)
+        {
+            if (order == null)
+                return;
+
+            RecordOrderEvent(order, "order_register_failed", message);
+
+            if (_entryOrder != null && order.Id == _entryOrder.Id)
+            {
+                ResetTradeState();
+                RaiseShowNotification(
+                    $"{GetInstanceLabel()}: входная заявка отклонена. {message}");
+                return;
+            }
+
+            RaiseShowNotification(
+                $"{GetInstanceLabel()}: заявка отклонена. {message}");
+        }
+
+        protected override void OnOrderCancelFailed(Order order, string message)
+        {
+            if (order == null)
+                return;
+
+            RecordOrderEvent(order, "order_cancel_failed", message);
+            RaiseDebug($"Не удалось отменить заявку. {message}");
+        }
+
         private void CheckSignal(int bar)
         {
             if (_tradeState != TradeState.Idle || _entrySent || CurrentPosition != 0)
@@ -321,6 +465,9 @@ namespace CashReaper
                 return;
             }
 
+            if (!ValidateTradingContext())
+                return;
+
             SendEntryOrder(direction);
         }
 
@@ -354,6 +501,37 @@ namespace CashReaper
                 RaiseShowNotification(
                     $"{GetInstanceLabel()}: входная заявка не отправлена. Состояние сброшено. Ошибка: {ex.Message}");
             }
+        }
+
+        private bool ValidateTradingContext()
+        {
+            var errors = "";
+
+            if (Portfolio == null)
+                errors += "portfolio_missing;";
+
+            if (Security == null)
+                errors += "security_missing;";
+
+            if (_activeVolume <= 0)
+                errors += "volume_zero;";
+
+            if (string.IsNullOrEmpty(errors))
+                return true;
+
+            RecordTradeEvent(
+                "entry_blocked",
+                _lastProcessedSignalBar,
+                _entryDirection.ToString(),
+                false,
+                errors,
+                _activeVolume);
+
+            RaiseShowNotification(
+                $"{GetInstanceLabel()}: вход заблокирован до отправки заявки. {errors} Проверь выбранный инструмент, портфель и Replay Account.");
+
+            ResetTradeState();
+            return false;
         }
 
         private void HandleEntryFilled()
@@ -524,10 +702,10 @@ namespace CashReaper
 
         private decimal CalculateTakeProfitDistance(decimal basePrice, decimal orderVolume)
         {
-            if (ProtectionCalculationMode == 1)
+            if (ProtectionCalculationMode == ProtectionMode.PricePercent)
                 return Math.Abs(basePrice) * TakeProfitPricePercent / 100m;
 
-            if (ProtectionCalculationMode == 2 && DepositReferenceValue > 0 && PointValue > 0 && orderVolume > 0)
+            if (ProtectionCalculationMode == ProtectionMode.DepositPercent && DepositReferenceValue > 0 && PointValue > 0 && orderVolume > 0)
                 return DepositReferenceValue * TakeProfitDepositPercent / 100m / (orderVolume * PointValue);
 
             return TakeProfitPoints;
@@ -535,10 +713,10 @@ namespace CashReaper
 
         private decimal CalculateStopLossDistance(decimal basePrice, decimal orderVolume)
         {
-            if (ProtectionCalculationMode == 1)
+            if (ProtectionCalculationMode == ProtectionMode.PricePercent)
                 return Math.Abs(basePrice) * StopLossPricePercent / 100m;
 
-            if (ProtectionCalculationMode == 2 && DepositReferenceValue > 0 && PointValue > 0 && orderVolume > 0)
+            if (ProtectionCalculationMode == ProtectionMode.DepositPercent && DepositReferenceValue > 0 && PointValue > 0 && orderVolume > 0)
                 return DepositReferenceValue * StopLossDepositPercent / 100m / (orderVolume * PointValue);
 
             return StopLossPoints;
@@ -567,7 +745,7 @@ namespace CashReaper
 
             var step = Math.Min(_lossSeriesStep, Math.Max(MaxSeriesStep, 1));
 
-            if (SeriesSizingMode == 2)
+            if (SeriesSizingMode == SeriesMode.Martingale)
                 return (decimal)Math.Pow(2, step);
 
             return 1m + step;
@@ -903,6 +1081,11 @@ namespace CashReaper
                         Csv(RangeSize),
                         Csv(CommissionPerContract),
                         Csv(CommissionPercent),
+                        Csv(Portfolio == null ? "" : Portfolio.ToString()),
+                        Csv(Connector == null ? "" : Connector.ToString()),
+                        Csv(MarketReplayMode),
+                        Csv(TradingEnabled),
+                        Csv(CurrentPosition),
                         Csv(""),
                         Csv(""),
                         Csv(""),
@@ -917,7 +1100,7 @@ namespace CashReaper
 
         private string GetStatisticsHeader()
         {
-            return "time,instance,instrument,event,bar,state,open,high,low,close,body,range,macd_difference,body_engulf,signal,direction,accepted,reason,volume,tp,sl,tp_points,sl_points,protection_mode,series_step,range_size,commission_per_contract,commission_percent,delta,delta_volume,cvd,imbalance";
+            return "time,instance,instrument,event,bar,state,open,high,low,close,body,range,macd_difference,body_engulf,signal,direction,accepted,reason,volume,tp,sl,tp_points,sl_points,protection_mode,series_step,range_size,commission_per_contract,commission_percent,portfolio,connector,market_replay_mode,trading_enabled,current_position,delta,delta_volume,cvd,imbalance";
         }
 
         private string GetStatisticsPath()
@@ -948,12 +1131,16 @@ namespace CashReaper
                 return true;
 
             var terminalTime = GetTerminalTime(bar);
-            var stopTime = new TimeSpan(
-                Clamp(TradingStopHour, 0, 23),
-                Clamp(TradingStopMinute, 0, 59),
+            var start = new TimeSpan(
+                Clamp(TradingPauseStartHour, 0, 23),
+                Clamp(TradingPauseStartMinute, 0, 59),
+                0);
+            var end = new TimeSpan(
+                Clamp(TradingPauseEndHour, 0, 23),
+                Clamp(TradingPauseEndMinute, 0, 59),
                 0);
 
-            if (terminalTime.TimeOfDay < stopTime)
+            if (!IsInsidePause(terminalTime.TimeOfDay, start, end))
             {
                 _tradingStoppedByTime = false;
                 return true;
@@ -965,7 +1152,7 @@ namespace CashReaper
                 _lastTimeLimitNoticeDate = terminalTime.Date;
 
                 RaiseShowNotification(
-                    $"{GetInstanceLabel()}: лимит времени торговли достигнут. TerminalTime={terminalTime:HH:mm}; StopTime={GetStopTimeText()}. Новые входы запрещены.");
+                    $"{GetInstanceLabel()}: включена пауза торговли. TerminalTime={terminalTime:HH:mm}; Pause={GetPausePeriodText()}. Новые входы запрещены.");
             }
 
             return false;
@@ -984,9 +1171,23 @@ namespace CashReaper
             }
         }
 
-        private string GetStopTimeText()
+        private bool IsInsidePause(TimeSpan current, TimeSpan start, TimeSpan end)
         {
-            return $"{Clamp(TradingStopHour, 0, 23):00}:{Clamp(TradingStopMinute, 0, 59):00}";
+            if (start == end)
+                return false;
+
+            if (start < end)
+                return current >= start && current < end;
+
+            return current >= start || current < end;
+        }
+
+        private string GetPausePeriodText()
+        {
+            return
+                $"{Clamp(TradingPauseStartHour, 0, 23):00}:{Clamp(TradingPauseStartMinute, 0, 59):00}" +
+                "-" +
+                $"{Clamp(TradingPauseEndHour, 0, 23):00}:{Clamp(TradingPauseEndMinute, 0, 59):00}";
         }
 
         private int Clamp(int value, int min, int max)
@@ -1004,6 +1205,15 @@ namespace CashReaper
         {
             var securityName = Security == null ? "unknown" : Security.ToString();
             return $"CashReaper[{securityName}; {_instanceId}]";
+        }
+
+        private string GetTradingContextText()
+        {
+            return
+                $"Portfolio={(Portfolio == null ? "empty" : Portfolio.ToString())}; " +
+                $"Security={(Security == null ? "empty" : Security.ToString())}; " +
+                $"Connector={(Connector == null ? "empty" : Connector.ToString())}; " +
+                $"Position={CurrentPosition}";
         }
 
         private void EnsureSize(int size)
