@@ -69,6 +69,9 @@ namespace CashReaper
         [Display(GroupName = "03. Recovery", Name = "Post-close cooldown bars", Order = 101)]
         public int PostCloseCooldownBars { get; set; } = 2;
 
+        [Display(GroupName = "03. Recovery", Name = "Protective cancel retry bars", Order = 102)]
+        public int ProtectiveCancelRetryBars { get; set; } = 5;
+
         [Display(GroupName = "04. Time filter", Name = "Pause start hour", Order = 110)]
         public int TradingPauseStartHour { get; set; } = 23;
 
@@ -163,10 +166,14 @@ namespace CashReaper
         private int _lastProtectiveRetryBar = -1;
         private DateTime _lastTimeLimitNoticeDate = DateTime.MinValue;
         private int _entriesBlockedUntilBar = -1;
+        private int _cancelRetryUntilBar = -1;
+        private int _lastCancelRetryBar = -1;
 
         private Order _entryOrder;
         private Order _takeProfitOrder;
         private Order _stopLossOrder;
+        private Order _pendingCancelTakeProfitOrder;
+        private Order _pendingCancelStopLossOrder;
 
         private OrderDirections _entryDirection;
         private TradeState _tradeState = TradeState.Idle;
@@ -292,6 +299,7 @@ namespace CashReaper
 
             SyncPositionState(signalBar, "before_signal_check");
             RecoverAfterConnectionGap(signalBar);
+            RetryProtectiveCancellation(signalBar);
             CheckSignal(signalBar);
             SyncPositionState(signalBar, "after_signal_check");
         }
@@ -438,6 +446,13 @@ namespace CashReaper
 
         private void CheckSignal(int bar)
         {
+            if ((_pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null) && bar <= _cancelRetryUntilBar)
+            {
+                RecordBarDecision(bar, null, null, 0, false, "", false, "protective_cancel_pending");
+                RaiseDebug($"Вход заблокирован до завершения повторной отмены защитных заявок. Bar={bar}; RetryUntil={_cancelRetryUntilBar}");
+                return;
+            }
+
             if (bar <= _entriesBlockedUntilBar)
             {
                 RecordBarDecision(bar, null, null, 0, false, "", false, "post_close_cooldown");
@@ -986,15 +1001,50 @@ namespace CashReaper
 
         private void CancelProtectiveOrders()
         {
+            if (_takeProfitOrder != null)
+                _pendingCancelTakeProfitOrder = _takeProfitOrder;
+
+            if (_stopLossOrder != null)
+                _pendingCancelStopLossOrder = _stopLossOrder;
+
             TryCancelOrder(_takeProfitOrder);
             TryCancelOrder(_stopLossOrder);
+
+            if (_pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
+            {
+                _lastCancelRetryBar = -1;
+                _cancelRetryUntilBar = _lastProcessedSignalBar + Math.Max(ProtectiveCancelRetryBars, 1);
+            }
 
             _takeProfitOrder = null;
             _stopLossOrder = null;
             _protectiveOrdersSent = false;
         }
 
-        private void TryCancelOrder(Order order)
+        private void RetryProtectiveCancellation(int signalBar)
+        {
+            if (_pendingCancelTakeProfitOrder == null && _pendingCancelStopLossOrder == null)
+                return;
+
+            if (signalBar > _cancelRetryUntilBar)
+            {
+                _pendingCancelTakeProfitOrder = null;
+                _pendingCancelStopLossOrder = null;
+                _cancelRetryUntilBar = -1;
+                _lastCancelRetryBar = -1;
+                return;
+            }
+
+            if (signalBar <= _lastCancelRetryBar)
+                return;
+
+            _lastCancelRetryBar = signalBar;
+
+            TryCancelOrder(_pendingCancelTakeProfitOrder, "protective_cancel_retry");
+            TryCancelOrder(_pendingCancelStopLossOrder, "protective_cancel_retry");
+        }
+
+        private void TryCancelOrder(Order order, string eventType = "protective_cancel_requested")
         {
             if (order == null)
                 return;
@@ -1002,7 +1052,7 @@ namespace CashReaper
             try
             {
                 CancelOrder(order);
-                RecordOrderEvent(order, "protective_cancel_requested", "cancel_order_ok");
+                RecordOrderEvent(order, eventType, "cancel_order_ok");
             }
             catch (Exception ex)
             {
