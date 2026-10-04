@@ -176,6 +176,7 @@ namespace CashReaper
         private decimal _activeVolume;
         private decimal _entryBasePrice;
         private decimal _lastKnownPosition;
+        private decimal _trackedPosition;
         private int _lossSeriesStep;
 
         public CashReaperStrategy() : base(true)
@@ -185,25 +186,26 @@ namespace CashReaper
 
         protected override void OnStarted()
         {
-            _lastKnownPosition = CurrentPosition;
+            _trackedPosition = CurrentPosition;
+            _lastKnownPosition = GetActivePosition();
 
             if (SkipOldSignalOnStart)
                 _lastProcessedSignalBar = Math.Max(_lastProcessedSignalBar, CurrentBar - 2);
 
-            if (CurrentPosition == 0)
+            if (GetActivePosition() == 0)
             {
                 ResetTradeState();
             }
             else
             {
                 _entrySent = true;
-                _entryDirection = CurrentPosition > 0
+                _entryDirection = GetActivePosition() > 0
                     ? OrderDirections.Buy
                     : OrderDirections.Sell;
                 _tradeState = TradeState.PositionOpen;
 
                 RaiseShowNotification(
-                    $"{GetInstanceLabel()}: запущен. Есть открытая позиция: {CurrentPosition}. Новые входы заблокированы до закрытия позиции.");
+                    $"{GetInstanceLabel()}: запущен. Есть открытая позиция: {GetActivePosition()}. Новые входы заблокированы до закрытия позиции.");
 
                 if (RestoreProtectiveOrdersOnStart)
                     RestoreProtectionForExistingPosition();
@@ -229,7 +231,7 @@ namespace CashReaper
         {
             CancelProtectiveOrders();
 
-            if (CurrentPosition == 0)
+            if (GetActivePosition() == 0)
             {
                 ResetTradeState();
                 RaiseShowNotification($"{GetInstanceLabel()}: остановлен. Позиции нет, состояние сброшено.");
@@ -237,7 +239,7 @@ namespace CashReaper
             else
             {
                 RaiseShowNotification(
-                    $"{GetInstanceLabel()}: остановлен. Внимание: позиция всё ещё открыта: {CurrentPosition}. Защитные заявки стратегии сняты.");
+                    $"{GetInstanceLabel()}: остановлен. Внимание: позиция всё ещё открыта: {GetActivePosition()}. Защитные заявки стратегии сняты.");
             }
 
             base.OnStopping();
@@ -296,32 +298,32 @@ namespace CashReaper
 
             if (_entryOrder != null && order.Id == _entryOrder.Id)
             {
-                if (CurrentPosition != 0 && !_protectiveOrdersSent)
+                if (GetActivePosition() != 0 && !_protectiveOrdersSent)
                     HandleEntryFilled();
 
                 return;
             }
 
-            if (_takeProfitOrder != null && order.Id == _takeProfitOrder.Id && CurrentPosition == 0)
+            if (_takeProfitOrder != null && order.Id == _takeProfitOrder.Id && GetActivePosition() == 0)
             {
                 HandleTradeClosed("TP");
                 return;
             }
 
-            if (_stopLossOrder != null && order.Id == _stopLossOrder.Id && CurrentPosition == 0)
+            if (_stopLossOrder != null && order.Id == _stopLossOrder.Id && GetActivePosition() == 0)
             {
                 HandleTradeClosed("SL");
                 return;
             }
 
-            if (CurrentPosition != 0 && _entrySent && !_protectiveOrdersSent)
+            if (GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent)
             {
                 RaiseDebug("Позиция есть, но защитные заявки ещё не активны. Проверяю защиту.");
                 PlaceProtectiveOrders();
                 return;
             }
 
-            if (CurrentPosition == 0 && _entrySent && _protectiveOrdersSent)
+            if (GetActivePosition() == 0 && _entrySent && _protectiveOrdersSent)
             {
                 HandleTradeClosed("unknown");
             }
@@ -332,15 +334,26 @@ namespace CashReaper
             if (myTrade == null)
                 return;
 
+            var previousPosition = GetActivePosition();
+            ApplyMyTradeToTrackedPosition(myTrade);
+            var activePosition = GetActivePosition();
+
             RecordTradeEvent(
                 "my_trade",
                 _lastProcessedSignalBar,
-                _entryDirection.ToString(),
+                myTrade.OrderDirection.ToString(),
                 true,
-                myTrade.ToString(),
-                Math.Abs(CurrentPosition));
+                $"{myTrade}; previous={previousPosition}; tracked={_trackedPosition}; current={CurrentPosition}",
+                myTrade.Volume);
 
-            SyncPositionState(_lastProcessedSignalBar, "my_trade");
+            if (previousPosition == 0 && activePosition != 0 && _entrySent && !_protectiveOrdersSent)
+            {
+                HandleEntryFilled();
+                return;
+            }
+
+            if (previousPosition != 0 && activePosition == 0 && _entrySent)
+                HandleTradeClosed(GetTradeCloseOutcome(myTrade));
         }
 
         protected override void OnOrderRegisterFailed(Order order, string message)
@@ -373,10 +386,10 @@ namespace CashReaper
 
         private void CheckSignal(int bar)
         {
-            if (_tradeState != TradeState.Idle || _entrySent || CurrentPosition != 0)
+            if (_tradeState != TradeState.Idle || _entrySent || GetActivePosition() != 0)
             {
                 RaiseDebug(
-                    $"Вход заблокирован. Bar={bar}; State={_tradeState}; EntrySent={_entrySent}; Position={CurrentPosition}");
+                    $"Вход заблокирован. Bar={bar}; State={_tradeState}; EntrySent={_entrySent}; Position={GetActivePosition()}");
                 return;
             }
 
@@ -536,23 +549,27 @@ namespace CashReaper
 
         private void HandleEntryFilled()
         {
+            var activePosition = GetActivePosition();
+
             _tradeState = TradeState.PositionOpen;
-            _lastKnownPosition = CurrentPosition;
-            RecordTradeEvent("entry_filled", _lastProcessedSignalBar, _entryDirection.ToString(), true, "position_open", Math.Abs(CurrentPosition));
+            _lastKnownPosition = activePosition;
+            RecordTradeEvent("entry_filled", _lastProcessedSignalBar, _entryDirection.ToString(), true, "position_open", Math.Abs(activePosition));
 
             RaiseShowNotification(
-                $"{GetInstanceLabel()}: вход исполнен. Position={CurrentPosition}; TP={_takeProfitPrice}; SL={_stopLossPrice}");
+                $"{GetInstanceLabel()}: вход исполнен. Position={activePosition}; TP={_takeProfitPrice}; SL={_stopLossPrice}");
 
             PlaceProtectiveOrders();
         }
 
         private void PlaceProtectiveOrders()
         {
-            if (CurrentPosition == 0)
+            var activePosition = GetActivePosition();
+
+            if (activePosition == 0)
                 return;
 
             var exitDirection = GetExitDirectionForCurrentPosition();
-            var quantity = Math.Abs(CurrentPosition);
+            var quantity = Math.Abs(activePosition);
 
             _takeProfitOrder = new Order
             {
@@ -611,9 +628,9 @@ namespace CashReaper
 
             _entrySent = true;
             _entrySentBar = bar;
-            _activeVolume = Math.Abs(CurrentPosition);
+            _activeVolume = Math.Abs(GetActivePosition());
             _entryBasePrice = candle.Close;
-            _entryDirection = CurrentPosition > 0
+            _entryDirection = GetActivePosition() > 0
                 ? OrderDirections.Buy
                 : OrderDirections.Sell;
 
@@ -630,7 +647,7 @@ namespace CashReaper
             if (!AutoRecoveryEnabled)
                 return;
 
-            if (CurrentPosition != 0 && _entrySent && !_protectiveOrdersSent)
+            if (GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent)
             {
                 if (_lastProtectiveRetryBar >= 0 &&
                     signalBar - _lastProtectiveRetryBar < ProtectiveRetryBars)
@@ -643,7 +660,7 @@ namespace CashReaper
                 return;
             }
 
-            if (CurrentPosition == 0 && _tradeState == TradeState.ProtectiveOrdersActive)
+            if (GetActivePosition() == 0 && _tradeState == TradeState.ProtectiveOrdersActive)
             {
                 RaiseShowNotification(
                     $"{GetInstanceLabel()}: позиция закрыта после восстановления связи. Состояние сброшено.");
@@ -652,7 +669,7 @@ namespace CashReaper
                 return;
             }
 
-            if (!_entrySent || _protectiveOrdersSent || CurrentPosition != 0 || _entrySentBar < 0)
+            if (!_entrySent || _protectiveOrdersSent || GetActivePosition() != 0 || _entrySentBar < 0)
                 return;
 
             if (signalBar - _entrySentBar < EntryRecoveryBars)
@@ -675,7 +692,7 @@ namespace CashReaper
                 _lossSeriesStep = Math.Min(Math.Max(MaxSeriesStep, 1), _lossSeriesStep + 1);
 
             RecordTradeClosed(outcome);
-            _lastKnownPosition = CurrentPosition;
+            _lastKnownPosition = GetActivePosition();
 
             RaiseShowNotification(
                 $"{GetInstanceLabel()}: позиция закрыта. Outcome={outcome}; NextSeriesStep={_lossSeriesStep}");
@@ -769,9 +786,47 @@ namespace CashReaper
 
         private OrderDirections GetExitDirectionForCurrentPosition()
         {
-            return CurrentPosition > 0
+            return GetActivePosition() > 0
                 ? OrderDirections.Sell
                 : OrderDirections.Buy;
+        }
+
+        private decimal GetActivePosition()
+        {
+            return CurrentPosition != 0
+                ? CurrentPosition
+                : _trackedPosition;
+        }
+
+        private void ApplyMyTradeToTrackedPosition(MyTrade myTrade)
+        {
+            var signedVolume = myTrade.OrderDirection == OrderDirections.Buy
+                ? myTrade.Volume
+                : -myTrade.Volume;
+
+            _trackedPosition += signedVolume;
+
+            if (Math.Abs(_trackedPosition) < 0.00000001m)
+                _trackedPosition = 0;
+        }
+
+        private string GetTradeCloseOutcome(MyTrade myTrade)
+        {
+            if (IsSameOrder(_takeProfitOrder, myTrade))
+                return "TP";
+
+            if (IsSameOrder(_stopLossOrder, myTrade))
+                return "SL";
+
+            return "unknown";
+        }
+
+        private bool IsSameOrder(Order order, MyTrade myTrade)
+        {
+            if (order == null || myTrade == null)
+                return false;
+
+            return Convert.ToString(order.Id, CultureInfo.InvariantCulture) == myTrade.OrderId;
         }
 
         private bool TryOpenOrder(Order order, string orderName)
@@ -818,27 +873,32 @@ namespace CashReaper
 
         private void SyncPositionState(int bar, string reason)
         {
-            if (CurrentPosition == _lastKnownPosition)
+            if (CurrentPosition != 0 || !MarketReplayMode)
+                _trackedPosition = CurrentPosition;
+
+            if (GetActivePosition() == _lastKnownPosition)
                 return;
 
             var previousPosition = _lastKnownPosition;
-            _lastKnownPosition = CurrentPosition;
+            var activePosition = GetActivePosition();
+
+            _lastKnownPosition = activePosition;
 
             RecordTradeEvent(
                 "position_changed",
                 bar,
-                CurrentPosition > 0 ? OrderDirections.Buy.ToString() : CurrentPosition < 0 ? OrderDirections.Sell.ToString() : _entryDirection.ToString(),
+                activePosition > 0 ? OrderDirections.Buy.ToString() : activePosition < 0 ? OrderDirections.Sell.ToString() : _entryDirection.ToString(),
                 true,
-                $"{reason}; previous={previousPosition}; current={CurrentPosition}",
-                Math.Abs(CurrentPosition));
+                $"{reason}; previous={previousPosition}; current={activePosition}",
+                Math.Abs(activePosition));
 
-            if (previousPosition == 0 && CurrentPosition != 0 && _entrySent && !_protectiveOrdersSent)
+            if (previousPosition == 0 && activePosition != 0 && _entrySent && !_protectiveOrdersSent)
             {
                 HandleEntryFilled();
                 return;
             }
 
-            if (previousPosition != 0 && CurrentPosition == 0 && _entrySent)
+            if (previousPosition != 0 && activePosition == 0 && _entrySent)
                 HandleTradeClosed(reason);
         }
 
@@ -855,7 +915,8 @@ namespace CashReaper
             _tradingStoppedByTime = false;
             _entrySentBar = -1;
             _lastProtectiveRetryBar = -1;
-            _lastKnownPosition = CurrentPosition;
+            _trackedPosition = CurrentPosition;
+            _lastKnownPosition = GetActivePosition();
 
             _takeProfitPrice = 0;
             _stopLossPrice = 0;
@@ -1085,7 +1146,7 @@ namespace CashReaper
                         Csv(Connector == null ? "" : Connector.ToString()),
                         Csv(MarketReplayMode),
                         Csv(TradingEnabled),
-                        Csv(CurrentPosition),
+                        Csv(GetActivePosition()),
                         Csv(""),
                         Csv(""),
                         Csv(""),
@@ -1213,7 +1274,7 @@ namespace CashReaper
                 $"Portfolio={(Portfolio == null ? "empty" : Portfolio.ToString())}; " +
                 $"Security={(Security == null ? "empty" : Security.ToString())}; " +
                 $"Connector={(Connector == null ? "empty" : Connector.ToString())}; " +
-                $"Position={CurrentPosition}";
+                $"Position={GetActivePosition()}";
         }
 
         private void EnsureSize(int size)
