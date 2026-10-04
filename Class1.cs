@@ -66,6 +66,9 @@ namespace CashReaper
         [Display(GroupName = "03. Recovery", Name = "TP/SL retry bars", Order = 100)]
         public int ProtectiveRetryBars { get; set; } = 1;
 
+        [Display(GroupName = "03. Recovery", Name = "Post-close cooldown bars", Order = 101)]
+        public int PostCloseCooldownBars { get; set; } = 2;
+
         [Display(GroupName = "04. Time filter", Name = "Pause start hour", Order = 110)]
         public int TradingPauseStartHour { get; set; } = 23;
 
@@ -159,6 +162,7 @@ namespace CashReaper
         private int _entrySentBar = -1;
         private int _lastProtectiveRetryBar = -1;
         private DateTime _lastTimeLimitNoticeDate = DateTime.MinValue;
+        private int _entriesBlockedUntilBar = -1;
 
         private Order _entryOrder;
         private Order _takeProfitOrder;
@@ -170,6 +174,7 @@ namespace CashReaper
         private bool _entrySent;
         private bool _protectiveOrdersSent;
         private bool _tradingStoppedByTime;
+        private bool _emergencyClosing;
 
         private decimal _takeProfitPrice;
         private decimal _stopLossPrice;
@@ -346,6 +351,38 @@ namespace CashReaper
                 $"{myTrade}; previous={previousPosition}; tracked={_trackedPosition}; current={CurrentPosition}",
                 myTrade.Volume);
 
+            if (_emergencyClosing)
+            {
+                if (activePosition == 0)
+                {
+                    RecordTradeEvent(
+                        "emergency_flatten_done",
+                        _lastProcessedSignalBar,
+                        myTrade.OrderDirection.ToString(),
+                        true,
+                        myTrade.ToString(),
+                        myTrade.Volume);
+
+                    ResetTradeState();
+                }
+
+                return;
+            }
+
+            if (!_entrySent && !_protectiveOrdersSent && activePosition != 0)
+            {
+                RecordTradeEvent(
+                    "orphan_trade_detected",
+                    _lastProcessedSignalBar,
+                    myTrade.OrderDirection.ToString(),
+                    false,
+                    "trade_without_active_strategy_position",
+                    myTrade.Volume);
+
+                EmergencyFlattenPosition("orphan_trade");
+                return;
+            }
+
             if (previousPosition == 0 && activePosition != 0 && _entrySent && !_protectiveOrdersSent)
             {
                 HandleEntryFilled();
@@ -386,6 +423,13 @@ namespace CashReaper
 
         private void CheckSignal(int bar)
         {
+            if (bar <= _entriesBlockedUntilBar)
+            {
+                RecordBarDecision(bar, null, null, 0, false, "", false, "post_close_cooldown");
+                RaiseDebug($"Вход заблокирован паузой после закрытия. Bar={bar}; BlockedUntil={_entriesBlockedUntilBar}");
+                return;
+            }
+
             if (_tradeState != TradeState.Idle || _entrySent || GetActivePosition() != 0)
             {
                 RaiseDebug(
@@ -685,6 +729,7 @@ namespace CashReaper
         private void HandleTradeClosed(string outcome)
         {
             CancelProtectiveOrders();
+            _entriesBlockedUntilBar = Math.Max(_entriesBlockedUntilBar, _lastProcessedSignalBar + Math.Max(PostCloseCooldownBars, 1));
 
             if (outcome == "TP")
                 _lossSeriesStep = 0;
@@ -829,6 +874,61 @@ namespace CashReaper
             return Convert.ToString(order.Id, CultureInfo.InvariantCulture) == myTrade.OrderId;
         }
 
+        private void EmergencyFlattenPosition(string reason)
+        {
+            var activePosition = GetActivePosition();
+
+            if (activePosition == 0)
+                return;
+
+            var closeDirection = activePosition > 0
+                ? OrderDirections.Sell
+                : OrderDirections.Buy;
+
+            var order = new Order
+            {
+                Portfolio = Portfolio,
+                Security = Security,
+                Direction = closeDirection,
+                Type = OrderTypes.Market,
+                QuantityToFill = Math.Abs(activePosition)
+            };
+
+            _emergencyClosing = true;
+            _entriesBlockedUntilBar = Math.Max(_entriesBlockedUntilBar, _lastProcessedSignalBar + Math.Max(PostCloseCooldownBars, 1));
+
+            try
+            {
+                OpenOrder(order);
+
+                RecordTradeEvent(
+                    "emergency_flatten_sent",
+                    _lastProcessedSignalBar,
+                    closeDirection.ToString(),
+                    true,
+                    reason,
+                    Math.Abs(activePosition));
+
+                RaiseShowNotification(
+                    $"{GetInstanceLabel()}: обнаружено исполнение без активной сделки стратегии. Отправляю аварийное закрытие {closeDirection}; Volume={Math.Abs(activePosition)}.");
+            }
+            catch (Exception ex)
+            {
+                _emergencyClosing = false;
+
+                RecordTradeEvent(
+                    "emergency_flatten_error",
+                    _lastProcessedSignalBar,
+                    closeDirection.ToString(),
+                    false,
+                    ex.Message,
+                    Math.Abs(activePosition));
+
+                RaiseShowNotification(
+                    $"{GetInstanceLabel()}: не удалось аварийно закрыть неожиданную позицию. Ошибка: {ex.Message}");
+            }
+        }
+
         private bool TryOpenOrder(Order order, string orderName)
         {
             try
@@ -865,9 +965,12 @@ namespace CashReaper
             try
             {
                 CancelOrder(order);
+                RecordOrderEvent(order, "protective_cancel_requested", "cancel_order_ok");
             }
-            catch
+            catch (Exception ex)
             {
+                RecordOrderEvent(order, "protective_cancel_error", ex.Message);
+                RaiseDebug($"Не удалось отправить отмену защитной заявки. {ex.Message}");
             }
         }
 
@@ -913,6 +1016,7 @@ namespace CashReaper
             _entrySent = false;
             _protectiveOrdersSent = false;
             _tradingStoppedByTime = false;
+            _emergencyClosing = false;
             _entrySentBar = -1;
             _lastProtectiveRetryBar = -1;
             _trackedPosition = CurrentPosition;
