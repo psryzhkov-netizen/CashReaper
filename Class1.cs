@@ -180,6 +180,9 @@ namespace CashReaper
         private decimal _stopLossPrice;
         private decimal _activeVolume;
         private decimal _entryBasePrice;
+        private decimal _entryExecutionPrice;
+        private decimal _lastTradePnlPoints;
+        private decimal _totalPnlPoints;
         private decimal _lastKnownPosition;
         private decimal _trackedPosition;
         private int _lossSeriesStep;
@@ -343,12 +346,24 @@ namespace CashReaper
             ApplyMyTradeToTrackedPosition(myTrade);
             var activePosition = GetActivePosition();
 
+            if (previousPosition == 0 && activePosition != 0)
+            {
+                _entryExecutionPrice = myTrade.Price;
+                _lastTradePnlPoints = 0;
+            }
+
+            if (previousPosition != 0 && activePosition == 0)
+            {
+                _lastTradePnlPoints = CalculateClosedTradePnlPoints(previousPosition, _entryExecutionPrice, myTrade.Price);
+                _totalPnlPoints += _lastTradePnlPoints;
+            }
+
             RecordTradeEvent(
                 "my_trade",
                 _lastProcessedSignalBar,
                 myTrade.OrderDirection.ToString(),
                 true,
-                $"{myTrade}; previous={previousPosition}; tracked={_trackedPosition}; current={CurrentPosition}",
+                $"{myTrade}; previous={previousPosition}; tracked={_trackedPosition}; current={CurrentPosition}; last_pnl_points={_lastTradePnlPoints}; total_pnl_points={_totalPnlPoints}",
                 myTrade.Volume);
 
             if (_emergencyClosing)
@@ -874,6 +889,28 @@ namespace CashReaper
             return Convert.ToString(order.Id, CultureInfo.InvariantCulture) == myTrade.OrderId;
         }
 
+        private decimal CalculateClosedTradePnlPoints(decimal position, decimal entryPrice, decimal exitPrice)
+        {
+            if (entryPrice == 0 || exitPrice == 0 || position == 0)
+                return 0m;
+
+            return position > 0
+                ? exitPrice - entryPrice
+                : entryPrice - exitPrice;
+        }
+
+        private decimal CalculateUnrealizedPnlPoints(decimal marketPrice)
+        {
+            var activePosition = GetActivePosition();
+
+            if (activePosition == 0 || _entryExecutionPrice == 0 || marketPrice == 0)
+                return 0m;
+
+            return activePosition > 0
+                ? marketPrice - _entryExecutionPrice
+                : _entryExecutionPrice - marketPrice;
+        }
+
         private void EmergencyFlattenPosition(string reason)
         {
             var activePosition = GetActivePosition();
@@ -1024,6 +1061,7 @@ namespace CashReaper
 
             _takeProfitPrice = 0;
             _stopLossPrice = 0;
+            _entryExecutionPrice = 0;
         }
 
         private void RaiseDebug(string message)
@@ -1251,6 +1289,10 @@ namespace CashReaper
                         Csv(MarketReplayMode),
                         Csv(TradingEnabled),
                         Csv(GetActivePosition()),
+                        Csv(_entryExecutionPrice),
+                        Csv(CalculateUnrealizedPnlPoints(close)),
+                        Csv(_lastTradePnlPoints),
+                        Csv(_totalPnlPoints),
                         Csv(""),
                         Csv(""),
                         Csv(""),
@@ -1265,7 +1307,7 @@ namespace CashReaper
 
         private string GetStatisticsHeader()
         {
-            return "time,instance,instrument,event,bar,state,open,high,low,close,body,range,macd_difference,body_engulf,signal,direction,accepted,reason,volume,tp,sl,tp_points,sl_points,protection_mode,series_step,range_size,commission_per_contract,commission_percent,portfolio,connector,market_replay_mode,trading_enabled,current_position,delta,delta_volume,cvd,imbalance";
+            return "time,instance,instrument,event,bar,state,open,high,low,close,body,range,macd_difference,body_engulf,signal,direction,accepted,reason,volume,tp,sl,tp_points,sl_points,protection_mode,series_step,range_size,commission_per_contract,commission_percent,portfolio,connector,market_replay_mode,trading_enabled,current_position,entry_price,unrealized_pnl_points,last_trade_pnl_points,total_pnl_points,delta,delta_volume,cvd,imbalance";
         }
 
         private string GetStatisticsPath()
