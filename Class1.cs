@@ -366,6 +366,14 @@ namespace CashReaper
                 _totalPnlPoints += _lastTradePnlPoints;
             }
 
+            var positionReversed = IsPositionReversed(previousPosition, activePosition);
+
+            if (positionReversed)
+            {
+                _lastTradePnlPoints = CalculateClosedTradePnlPoints(previousPosition, _entryExecutionPrice, myTrade.Price);
+                _totalPnlPoints += _lastTradePnlPoints;
+            }
+
             RecordTradeEvent(
                 "my_trade",
                 _lastProcessedSignalBar,
@@ -403,6 +411,12 @@ namespace CashReaper
                     myTrade.Volume);
 
                 EmergencyFlattenPosition("orphan_trade");
+                return;
+            }
+
+            if (positionReversed && _entrySent)
+            {
+                HandleProtectiveOverfill(myTrade, previousPosition, activePosition);
                 return;
             }
 
@@ -775,6 +789,35 @@ namespace CashReaper
             ResetTradeState();
         }
 
+        private void HandleProtectiveOverfill(MyTrade myTrade, decimal previousPosition, decimal activePosition)
+        {
+            CancelProtectiveOrders();
+            _entriesBlockedUntilBar = Math.Max(_entriesBlockedUntilBar, _lastProcessedSignalBar + Math.Max(PostCloseCooldownBars, 1));
+
+            var outcome = GetTradeCloseOutcome(myTrade);
+
+            if (outcome == "TP")
+                _lossSeriesStep = 0;
+            else if (outcome == "SL")
+                _lossSeriesStep = Math.Min(Math.Max(MaxSeriesStep, 1), _lossSeriesStep + 1);
+
+            RecordTradeEvent(
+                "protective_overfill_detected",
+                _lastProcessedSignalBar,
+                myTrade.OrderDirection.ToString(),
+                false,
+                $"previous={previousPosition}; residual={activePosition}; outcome={outcome}; last_pnl_points={_lastTradePnlPoints}; total_pnl_points={_totalPnlPoints}",
+                Math.Abs(activePosition));
+
+            RecordTradeClosed($"{outcome}_overfill");
+
+            RaiseShowNotification(
+                $"{GetInstanceLabel()}: защитная заявка перевернула позицию. Previous={previousPosition}; Residual={activePosition}. Закрываю остаток аварийно.");
+
+            _lastKnownPosition = activePosition;
+            EmergencyFlattenPosition("protective_overfill");
+        }
+
         private void CalculateProtectionPrices(decimal basePrice, OrderDirections direction, decimal orderVolume)
         {
             var takeDistance = CalculateTakeProfitDistance(basePrice, orderVolume);
@@ -871,6 +914,13 @@ namespace CashReaper
             return CurrentPosition != 0
                 ? CurrentPosition
                 : _trackedPosition;
+        }
+
+        private static bool IsPositionReversed(decimal previousPosition, decimal activePosition)
+        {
+            return previousPosition != 0 &&
+                activePosition != 0 &&
+                Math.Sign(previousPosition) != Math.Sign(activePosition);
         }
 
         private void ApplyMyTradeToTrackedPosition(MyTrade myTrade)
@@ -1081,6 +1131,23 @@ namespace CashReaper
                 true,
                 $"{reason}; previous={previousPosition}; current={activePosition}",
                 Math.Abs(activePosition));
+
+            if (IsPositionReversed(previousPosition, activePosition) && _entrySent)
+            {
+                CancelProtectiveOrders();
+                _entriesBlockedUntilBar = Math.Max(_entriesBlockedUntilBar, bar + Math.Max(PostCloseCooldownBars, 1));
+
+                RecordTradeEvent(
+                    "position_reversal_detected",
+                    bar,
+                    activePosition > 0 ? OrderDirections.Buy.ToString() : OrderDirections.Sell.ToString(),
+                    false,
+                    $"{reason}; previous={previousPosition}; residual={activePosition}",
+                    Math.Abs(activePosition));
+
+                EmergencyFlattenPosition("position_reversal");
+                return;
+            }
 
             if (previousPosition == 0 && activePosition != 0 && _entrySent && !_protectiveOrdersSent)
             {
