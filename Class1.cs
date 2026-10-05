@@ -802,20 +802,20 @@ namespace CashReaper
                 _lossSeriesStep = Math.Min(Math.Max(MaxSeriesStep, 1), _lossSeriesStep + 1);
 
             RecordTradeEvent(
-                "protective_overfill_detected",
+                "protective_residual_detected",
                 _lastProcessedSignalBar,
                 myTrade.OrderDirection.ToString(),
                 false,
                 $"previous={previousPosition}; residual={activePosition}; outcome={outcome}; last_pnl_points={_lastTradePnlPoints}; total_pnl_points={_totalPnlPoints}",
                 Math.Abs(activePosition));
 
-            RecordTradeClosed($"{outcome}_overfill");
+            RecordTradeClosed($"{outcome}_residual");
 
             RaiseShowNotification(
-                $"{GetInstanceLabel()}: защитная заявка перевернула позицию. Previous={previousPosition}; Residual={activePosition}. Закрываю остаток аварийно.");
+                $"{GetInstanceLabel()}: защитная заявка оставила лишнюю позицию. Previous={previousPosition}; Extra={activePosition}. Закрываю остаток аварийно.");
 
             _lastKnownPosition = activePosition;
-            EmergencyFlattenPosition("protective_overfill");
+            EmergencyFlattenPosition("protective_residual");
         }
 
         private void CalculateProtectionPrices(decimal basePrice, OrderDirections direction, decimal orderVolume)
@@ -1138,14 +1138,14 @@ namespace CashReaper
                 _entriesBlockedUntilBar = Math.Max(_entriesBlockedUntilBar, bar + Math.Max(PostCloseCooldownBars, 1));
 
                 RecordTradeEvent(
-                    "position_reversal_detected",
+                    "unexpected_residual_position_detected",
                     bar,
                     activePosition > 0 ? OrderDirections.Buy.ToString() : OrderDirections.Sell.ToString(),
                     false,
                     $"{reason}; previous={previousPosition}; residual={activePosition}",
                     Math.Abs(activePosition));
 
-                EmergencyFlattenPosition("position_reversal");
+                EmergencyFlattenPosition("unexpected_residual");
                 return;
             }
 
