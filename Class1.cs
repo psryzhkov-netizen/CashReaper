@@ -140,7 +140,7 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Range size", Order = 200)]
         public int RangeSize { get; set; } = 5;
 
-        [Display(GroupName = "07. Signal", Name = "Use MACD filter", Description = "When disabled, a body engulfing pattern alone produces a signal.", Order = 201)]
+        [Display(GroupName = "07. Signal", Name = "Use MACD filter", Description = "MACD filters new entries only: long when difference > 0, short when difference < 0. An opposite body engulfing always closes the current position, even when MACD disagrees.", Order = 201)]
         public bool UseMacdFilter { get; set; } = true;
 
         [Display(GroupName = "07. Signal", Name = "Reverse on opposite engulfing", Description = "Close the current position on the opposite engulfing signal, then open in the new direction only after the close is filled. Disable TP/SL orders for this test.", Order = 202)]
@@ -652,27 +652,30 @@ namespace CashReaper
             var previousBearish = IsBearish(previous);
             var engulf = BodyEngulfs(current, previous);
 
-            var isLong =
+            var bullishEngulfing =
                 currentBullish &&
                 previousBearish &&
-                engulf &&
-                (!UseMacdFilter || diff > 0);
+                engulf;
 
-            var isShort =
+            var bearishEngulfing =
                 currentBearish &&
                 previousBullish &&
-                engulf &&
-                (!UseMacdFilter || diff < 0);
+                engulf;
 
-            var desiredDirection = isLong ? OrderDirections.Buy : OrderDirections.Sell;
+            var isLong = bullishEngulfing && (!UseMacdFilter || diff > 0);
+            var isShort = bearishEngulfing && (!UseMacdFilter || diff < 0);
+
             var activePosition = GetActivePosition();
 
             if (ReverseOnOppositeEngulfing && activePosition != 0)
             {
-                if ((isLong && activePosition < 0) || (isShort && activePosition > 0))
+                if ((bullishEngulfing && activePosition < 0) ||
+                    (bearishEngulfing && activePosition > 0))
                 {
-                    RecordBarDecision(bar, current, previous, diff, engulf, isLong ? "LONG" : "SHORT", true, "reversal_signal");
-                    BeginReversal(desiredDirection, bar);
+                    var direction = bullishEngulfing ? OrderDirections.Buy : OrderDirections.Sell;
+                    RecordBarDecision(bar, current, previous, diff, engulf,
+                        bullishEngulfing ? "LONG" : "SHORT", true, "opposite_engulfing_exit");
+                    BeginReversal(direction, bar);
                 }
                 return;
             }
@@ -816,6 +819,15 @@ namespace CashReaper
             _reversalPending = false;
             _pendingReversalBar = -1;
             ResetTradeState();
+
+            if (UseMacdFilter && (direction == OrderDirections.Buy
+                    ? _difference[signalBar] <= 0
+                    : _difference[signalBar] >= 0))
+            {
+                RecordTradeEvent("reversal_entry_blocked", signalBar, direction.ToString(), false,
+                    $"macd_direction_filter; difference={_difference[signalBar]}; position_closed=1", 0m);
+                return;
+            }
 
             if (accountLimitClosing || !TradingEnabled || !ReverseOnOppositeEngulfing ||
                 UseProtectiveOrders || _pendingCancelTakeProfitOrder != null ||
