@@ -50,6 +50,12 @@ namespace CashReaper
             StrategyTradesEstimate = 1
         }
 
+        public enum MacdFilterMode
+        {
+            Difference = 0,
+            LineCross = 1
+        }
+
         [Display(GroupName = "01. Trading", Name = "Enable trading", Order = 10)]
         public bool TradingEnabled { get; set; } = true;
 
@@ -139,6 +145,9 @@ namespace CashReaper
 
         [Display(GroupName = "07. Signal", Name = "Range size", Order = 200)]
         public int RangeSize { get; set; } = 5;
+
+        [Display(GroupName = "07. Signal", Name = "MACD filter mode", Description = "Difference: long when MACD is above signal, short when below. Line cross: long only when MACD crosses above signal on the closed signal bar, short only when it crosses below. Both modes also require the existing body-engulfing pattern.", Order = 205)]
+        public MacdFilterMode MacdMode { get; set; } = MacdFilterMode.Difference;
 
         [Display(GroupName = "08. TP/SL", Name = "TP/SL mode", Order = 250)]
         public ProtectionMode ProtectionCalculationMode { get; set; } = ProtectionMode.Points;
@@ -641,13 +650,13 @@ namespace CashReaper
                 currentBullish &&
                 previousBearish &&
                 engulf &&
-                diff > 0;
+                IsLongMacdSignal(bar);
 
             var isShort =
                 currentBearish &&
                 previousBullish &&
                 engulf &&
-                diff < 0;
+                IsShortMacdSignal(bar);
 
             if (isLong)
             {
@@ -663,7 +672,7 @@ namespace CashReaper
                 return;
             }
 
-            var rejectReason = GetRejectReason(currentBullish, currentBearish, previousBullish, previousBearish, engulf, diff);
+            var rejectReason = GetRejectReason(bar, currentBullish, currentBearish, previousBullish, previousBearish, engulf);
 
             RecordBarDecision(bar, current, previous, diff, engulf, "", false, rejectReason);
 
@@ -689,6 +698,7 @@ namespace CashReaper
                 $"Bar={bar}; " +
                 $"Close={signalCandle.Close}; " +
                 $"Difference={diff}; " +
+                $"MACDFilter={MacdMode}; " +
                 $"Volume={_activeVolume}; " +
                 $"TP={_takeProfitPrice}; " +
                 $"SL={_stopLossPrice}; " +
@@ -698,7 +708,8 @@ namespace CashReaper
                 $"SeriesStep={_lossSeriesStep}";
 
             RaiseShowNotification(message);
-            RecordSignal(bar, signalName, signalCandle.Close, diff, _activeVolume, "signal");
+            RecordSignal(bar, signalName, signalCandle.Close, diff, _activeVolume,
+                $"signal; macd_filter={MacdMode}; previous_difference={_difference[bar - 1]}");
 
             if (!TradingEnabled)
             {
@@ -1405,24 +1416,30 @@ namespace CashReaper
         }
 
         private string GetRejectReason(
+            int bar,
             bool currentBullish,
             bool currentBearish,
             bool previousBullish,
             bool previousBearish,
-            bool engulf,
-            decimal diff)
+            bool engulf)
         {
             if (!engulf)
                 return "no_body_engulf";
 
-            if (diff == 0)
+            var diff = _difference[bar];
+
+            if (MacdMode == MacdFilterMode.Difference && diff == 0)
                 return "macd_zero";
 
-            if (currentBullish && previousBearish && diff <= 0)
-                return "long_macd_filter";
+            if (currentBullish && previousBearish && !IsLongMacdSignal(bar))
+                return MacdMode == MacdFilterMode.LineCross
+                    ? $"long_macd_cross_filter; previous_difference={_difference[bar - 1]}; difference={diff}"
+                    : "long_macd_filter";
 
-            if (currentBearish && previousBullish && diff >= 0)
-                return "short_macd_filter";
+            if (currentBearish && previousBullish && !IsShortMacdSignal(bar))
+                return MacdMode == MacdFilterMode.LineCross
+                    ? $"short_macd_cross_filter; previous_difference={_difference[bar - 1]}; difference={diff}"
+                    : "short_macd_filter";
 
             if (!currentBullish && !currentBearish)
                 return "doji_current";
@@ -1431,6 +1448,20 @@ namespace CashReaper
                 return "doji_previous";
 
             return "bar_direction_filter";
+        }
+
+        private bool IsLongMacdSignal(int bar)
+        {
+            return MacdMode == MacdFilterMode.LineCross
+                ? bar > 0 && _difference[bar - 1] <= 0 && _difference[bar] > 0
+                : _difference[bar] > 0;
+        }
+
+        private bool IsShortMacdSignal(int bar)
+        {
+            return MacdMode == MacdFilterMode.LineCross
+                ? bar > 0 && _difference[bar - 1] >= 0 && _difference[bar] < 0
+                : _difference[bar] < 0;
         }
 
         private void RecordBarDecision(
@@ -2003,6 +2034,7 @@ namespace CashReaper
                 $"Portfolio={(Portfolio == null ? "empty" : Portfolio.ToString())}; " +
                 $"Security={(Security == null ? "empty" : Security.ToString())}; " +
                 $"Connector={(Connector == null ? "empty" : Connector.ToString())}; " +
+                $"MACDFilter={MacdMode}; " +
                 $"Position={GetActivePosition()}";
         }
 
