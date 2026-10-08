@@ -9,6 +9,7 @@ namespace CashReaper
 {
     public class CashReaperStrategy : ChartStrategy
     {
+        private static readonly object StatsFileLock = new object();
         private enum TradeState
         {
             Idle,
@@ -41,6 +42,12 @@ namespace CashReaper
         {
             AccountCurrency = 0,
             Points = 1
+        }
+
+        public enum MoneyPnlSource
+        {
+            AtasPortfolio = 0,
+            StrategyTradesEstimate = 1
         }
 
         [Display(GroupName = "01. Trading", Name = "Enable trading", Order = 10)]
@@ -99,6 +106,9 @@ namespace CashReaper
 
         [Display(GroupName = "05b. Daily loss limit", Name = "Loss limit: points", Description = "Used only when Calculate loss in is Points. Closed trades today plus the open position's price movement; without volume or commissions. Enter a positive number.", Order = 126)]
         public decimal DailyLossLimitPoints { get; set; } = 2m;
+
+        [Display(GroupName = "05c. Money limit source", Name = "Money PnL source", Description = "ATAS portfolio uses the selected account's daily ClosedPnL + OpenPnL. Strategy trades estimates this instance's daily PnL from fills, volume and Point value; use it to test money limits in Replay when portfolio PnL stays zero.", Order = 127)]
+        public MoneyPnlSource DailyMoneyPnlSource { get; set; } = MoneyPnlSource.AtasPortfolio;
 
         [Display(GroupName = "06. Series sizing", Name = "Use series sizing", Order = 150)]
         public bool SeriesSizingEnabled { get; set; } = true;
@@ -212,6 +222,12 @@ namespace CashReaper
         private DateTime _dailyPointDate = DateTime.MinValue;
         private decimal _dailyClosedPnlPoints;
         private decimal _dailyOpenBasePrice;
+        private DateTime _dailyAccountDate = DateTime.MinValue;
+        private decimal _dailyAccountEquityBaseline;
+        private decimal _dailyClosedPnlMoneyEstimate;
+        private decimal _dailyCommissionMoneyEstimate;
+        private decimal _moneyEstimatePosition;
+        private decimal _moneyEstimateBasePrice;
         private int _entriesBlockedUntilBar = -1;
         private int _cancelRetryUntilBar = -1;
         private int _lastCancelRetryBar = -1;
@@ -256,6 +272,7 @@ namespace CashReaper
         protected override void OnStarted()
         {
             _trackedPosition = CurrentPosition;
+            _moneyEstimatePosition = CurrentPosition;
             _lastKnownPosition = GetActivePosition();
 
             if (SkipOldSignalOnStart)
@@ -284,8 +301,8 @@ namespace CashReaper
 
             RaiseShowNotification(
                 TradingEnabled
-                    ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; ProfitTarget={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget)}; LossLimit={AccountLossLimitEnabled}/{DailyLossUnit}/{(DailyLossUnit == ProfitTargetUnit.Points ? DailyLossLimitPoints : AccountLossLimit)}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}"
-                    : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; ProfitTarget={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget)}; LossLimit={AccountLossLimitEnabled}/{DailyLossUnit}/{(DailyLossUnit == ProfitTargetUnit.Points ? DailyLossLimitPoints : AccountLossLimit)}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}");
+                    ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; ProfitTarget={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget)}; LossLimit={AccountLossLimitEnabled}/{DailyLossUnit}/{(DailyLossUnit == ProfitTargetUnit.Points ? DailyLossLimitPoints : AccountLossLimit)}; MoneySource={DailyMoneyPnlSource}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}"
+                    : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; ProfitTarget={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget)}; LossLimit={AccountLossLimitEnabled}/{DailyLossUnit}/{(DailyLossUnit == ProfitTargetUnit.Points ? DailyLossLimitPoints : AccountLossLimit)}; MoneySource={DailyMoneyPnlSource}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}");
 
             RecordTradeEvent(
                 "strategy_started",
@@ -344,6 +361,7 @@ namespace CashReaper
             if (bar != lastBar)
                 return;
 
+            UpdateDailyPointSession(GetTerminalTime(lastBar).Date, candle.Close, GetActivePosition());
             // Account OpenPnL changes on every price update, not only once per bar.
             CheckAccountLimits(bar);
 
@@ -447,6 +465,8 @@ namespace CashReaper
                 _dailyClosedPnlPoints += CalculateClosedTradePnlPoints(previousPosition, _dailyOpenBasePrice, myTrade.Price);
                 _dailyOpenBasePrice = myTrade.Price;
             }
+
+            UpdateDailyMoneyEstimate(myTrade);
 
             RecordTradeEvent(
                 "my_trade",
@@ -907,7 +927,9 @@ namespace CashReaper
             if (signalBar - _entrySentBar < EntryRecoveryBars)
                 return;
 
-            RecordTradeEvent("entry_order_timeout", signalBar, _entryDirection.ToString(), false, "position_not_opened", _activeVolume);
+            RecordTradeEvent("entry_order_timeout", signalBar, _entryDirection.ToString(), false,
+                $"position_not_opened; order_id={_entryOrder?.Id}; order_state={_entryOrder?.State}; portfolio={Portfolio}; money_source={DailyMoneyPnlSource}",
+                _activeVolume);
             ResetTradeState();
 
             RaiseShowNotification(
@@ -1558,14 +1580,15 @@ namespace CashReaper
             try
             {
                 var path = GetStatisticsPath();
-                var fileExists = File.Exists(path);
-
-                using (var writer = new StreamWriter(path, append: true))
+                lock (StatsFileLock)
                 {
-                    if (!fileExists)
-                        writer.WriteLine(GetStatisticsHeader());
+                    var fileExists = File.Exists(path);
+                    using (var writer = new StreamWriter(path, append: true))
+                    {
+                        if (!fileExists)
+                            writer.WriteLine(GetStatisticsHeader());
 
-                    writer.WriteLine(string.Join(",",
+                        writer.WriteLine(string.Join(",",
                         Csv(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)),
                         Csv(GetInstanceLabel()),
                         Csv(Security == null ? "" : Security.ToString()),
@@ -1606,7 +1629,30 @@ namespace CashReaper
                         Csv(""),
                         Csv(""),
                         Csv(""),
-                        Csv("")));
+                        Csv(""),
+                        Csv(CurrentBar > 0 ? GetTerminalTime(CurrentBar - 1).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : ""),
+                        Csv(Portfolio == null ? "" : Portfolio.Currency.ToString()),
+                        Csv(Portfolio == null ? 0m : Portfolio.ClosedPnL),
+                        Csv(Portfolio == null ? 0m : Portfolio.OpenPnL),
+                        Csv(_dailyAccountDate == DateTime.MinValue ? "" : _dailyAccountDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)),
+                        Csv(_dailyAccountEquityBaseline),
+                        Csv(Portfolio == null ? 0m : Portfolio.ClosedPnL + Portfolio.OpenPnL - _dailyAccountEquityBaseline),
+                        Csv(_dailyClosedPnlMoneyEstimate),
+                        Csv(_dailyCommissionMoneyEstimate),
+                        Csv(GetDailyStrategyMoneyEstimate(CurrentBar > 0 ? GetCandle(CurrentBar - 1).Close : 0m)),
+                        Csv(PointValue),
+                        Csv(DailyMoneyPnlSource),
+                        Csv(AccountProfitTargetEnabled),
+                        Csv(DailyProfitUnit),
+                        Csv(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget),
+                        Csv(AccountLossLimitEnabled),
+                        Csv(DailyLossUnit),
+                        Csv(DailyLossUnit == ProfitTargetUnit.Points ? DailyLossLimitPoints : AccountLossLimit),
+                        Csv(_accountStopBlockedDate == DateTime.MinValue ? "" : _accountStopBlockedDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)),
+                        Csv(_entryOrder == null ? "" : _entryOrder.Id),
+                        Csv(_entryOrder == null ? "" : _entryOrder.State.ToString()),
+                        Csv(_moneyEstimatePosition)));
+                    }
                 }
             }
             catch (Exception ex)
@@ -1617,7 +1663,7 @@ namespace CashReaper
 
         private string GetStatisticsHeader()
         {
-            return "time,instance,instrument,event,bar,state,open,high,low,close,body,range,macd_difference,body_engulf,signal,direction,accepted,reason,volume,tp,sl,tp_points,sl_points,protection_mode,series_step,range_size,commission_per_contract,commission_percent,portfolio,connector,market_replay_mode,trading_enabled,current_position,entry_price,unrealized_pnl_points,last_trade_pnl_points,total_pnl_points,delta,delta_volume,cvd,imbalance";
+            return "time,instance,instrument,event,bar,state,open,high,low,close,body,range,macd_difference,body_engulf,signal,direction,accepted,reason,volume,tp,sl,tp_points,sl_points,protection_mode,series_step,range_size,commission_per_contract,commission_percent,portfolio,connector,market_replay_mode,trading_enabled,current_position,entry_price,unrealized_pnl_points,last_trade_pnl_points,total_pnl_points,delta,delta_volume,cvd,imbalance,chart_time,account_currency,atas_closed_pnl,atas_open_pnl,daily_chart_date,atas_daily_equity_baseline,atas_daily_pnl,strategy_daily_closed_estimate,strategy_daily_commission_estimate,strategy_daily_net_estimate,point_value,money_pnl_source,profit_limit_enabled,profit_limit_unit,profit_limit_value,loss_limit_enabled,loss_limit_unit,loss_limit_value,blocked_chart_date,entry_order_id,entry_order_state,estimate_position";
         }
 
         private string GetStatisticsPath()
@@ -1632,7 +1678,10 @@ namespace CashReaper
                 ? "CashReaperStats.csv"
                 : StatisticsFileName;
 
-            return Path.Combine(directory, fileName);
+            // The schema changed; never append new columns under an old CSV header.
+            var diagnosticName = Path.GetFileNameWithoutExtension(fileName) + "-money-diagnostics" +
+                (string.IsNullOrEmpty(Path.GetExtension(fileName)) ? ".csv" : Path.GetExtension(fileName));
+            return Path.Combine(directory, diagnosticName);
         }
 
         private string Csv(object value)
@@ -1682,8 +1731,10 @@ namespace CashReaper
             var lossInPoints = DailyLossUnit == ProfitTargetUnit.Points;
             var needsAccountPnl = (AccountProfitTargetEnabled && !profitInPoints) ||
                                   (AccountLossLimitEnabled && !lossInPoints);
-            var invalidReason = needsAccountPnl && Portfolio == null
+            var invalidReason = needsAccountPnl && DailyMoneyPnlSource == MoneyPnlSource.AtasPortfolio && Portfolio == null
                 ? "счёт не выбран для денежного лимита"
+                : needsAccountPnl && DailyMoneyPnlSource == MoneyPnlSource.StrategyTradesEstimate && PointValue <= 0
+                    ? "стоимость пункта должна быть больше нуля для расчёта денег по сделкам"
                 : AccountProfitTargetEnabled && (profitInPoints ? DailyProfitTargetPoints : AccountProfitTarget) <= 0
                     ? "порог прибыли в выбранных единицах должен быть больше нуля"
                     : AccountLossLimitEnabled && (lossInPoints ? DailyLossLimitPoints : AccountLossLimit) <= 0
@@ -1706,7 +1757,11 @@ namespace CashReaper
             _accountLimitInvalidNotified = false;
             var closedPnl = Portfolio == null ? 0m : Portfolio.ClosedPnL;
             var openPnl = Portfolio == null ? 0m : Portfolio.OpenPnL;
-            var accountPnl = closedPnl + openPnl;
+            var atasDailyPnl = closedPnl + openPnl - _dailyAccountEquityBaseline;
+            var strategyDailyPnl = GetDailyStrategyMoneyEstimate(marketPrice);
+            var accountPnl = DailyMoneyPnlSource == MoneyPnlSource.StrategyTradesEstimate
+                ? strategyDailyPnl
+                : atasDailyPnl;
             var openPoints = GetActivePosition() == 0 ? 0m :
                 CalculateClosedTradePnlPoints(GetActivePosition(), _dailyOpenBasePrice, marketPrice);
             var dailyPoints = _dailyClosedPnlPoints + openPoints;
@@ -1733,12 +1788,12 @@ namespace CashReaper
             var resultInPoints = reason == AccountStopReason.Profit ? profitInPoints : lossInPoints;
             var resultText = resultInPoints
                 ? $"daily_points={dailyPoints}; closed_points={_dailyClosedPnlPoints}; open_points={openPoints}; limit={limit}; unit=points"
-                : $"closed_pnl={closedPnl}; open_pnl={openPnl}; account_pnl={accountPnl}; limit={limit}; currency={Portfolio.Currency}";
+                : $"source={DailyMoneyPnlSource}; closed_pnl={closedPnl}; open_pnl={openPnl}; baseline={_dailyAccountEquityBaseline}; atas_daily_pnl={atasDailyPnl}; strategy_daily_pnl={strategyDailyPnl}; selected_pnl={accountPnl}; limit={limit}; currency={(Portfolio == null ? "unknown" : Portfolio.Currency.ToString())}";
             RecordTradeEvent(reason == AccountStopReason.Profit ? "account_profit_target_reached" : "account_loss_limit_reached",
                 bar, "", false, resultText, 0m);
             var notification = resultInPoints
                 ? $"{GetInstanceLabel()}: дневной лимит {(reason == AccountStopReason.Profit ? "прибыли" : "убытка")} достигнут: {dailyPoints} пунктов (закрытая {_dailyClosedPnlPoints}, открытая {openPoints}; лимит {limit}). Новые входы остановлены до следующего дня."
-                : $"{GetInstanceLabel()}: дневной лимит {(reason == AccountStopReason.Profit ? "прибыли" : "убытка")} счёта достигнут: {accountPnl} {Portfolio.Currency} (закрытая {closedPnl}, открытая {openPnl}; лимит {limit}). Новые входы остановлены до следующего дня.";
+                : $"{GetInstanceLabel()}: дневной лимит {(reason == AccountStopReason.Profit ? "прибыли" : "убытка")} достигнут: {accountPnl} {(Portfolio == null ? "" : Portfolio.Currency.ToString())} (источник {DailyMoneyPnlSource}; лимит {limit}). Новые входы остановлены до следующего дня.";
             RaiseShowNotification(notification);
 
             if (GetActivePosition() != 0)
@@ -1754,8 +1809,64 @@ namespace CashReaper
 
             _dailyPointDate = chartDate;
             _dailyClosedPnlPoints = 0m;
+            _dailyClosedPnlMoneyEstimate = 0m;
+            _dailyCommissionMoneyEstimate = 0m;
+            _dailyAccountDate = chartDate;
+            _dailyAccountEquityBaseline = Portfolio == null ? 0m : Portfolio.ClosedPnL + Portfolio.OpenPnL;
             // A position carried over midnight contributes only the move observed today.
             _dailyOpenBasePrice = position == 0 ? 0m : marketPrice;
+            _moneyEstimateBasePrice = _moneyEstimatePosition == 0 ? 0m : marketPrice;
+        }
+
+        private void UpdateDailyMoneyEstimate(MyTrade trade)
+        {
+            var quantity = Math.Abs(trade.Volume);
+            _dailyCommissionMoneyEstimate += quantity * CommissionPerContract +
+                quantity * trade.Price * CommissionPercent / 100m;
+
+            var previousPosition = _moneyEstimatePosition;
+            var signedQuantity = trade.OrderDirection == OrderDirections.Buy ? quantity : -quantity;
+            var activePosition = previousPosition + signedQuantity;
+            _moneyEstimatePosition = Math.Abs(activePosition) < 0.00000001m ? 0m : activePosition;
+
+            if (previousPosition == 0)
+            {
+                if (_moneyEstimatePosition != 0)
+                    _moneyEstimateBasePrice = trade.Price;
+                return;
+            }
+
+            var sameDirection = Math.Sign(previousPosition) == Math.Sign(_moneyEstimatePosition);
+            var closedQuantity = sameDirection
+                ? Math.Max(0m, Math.Abs(previousPosition) - Math.Abs(_moneyEstimatePosition))
+                : Math.Abs(previousPosition);
+
+            if (closedQuantity > 0 && _moneyEstimateBasePrice != 0)
+            {
+                var direction = previousPosition > 0 ? 1m : -1m;
+                _dailyClosedPnlMoneyEstimate +=
+                    (trade.Price - _moneyEstimateBasePrice) * direction * closedQuantity * PointValue;
+            }
+
+            if (_moneyEstimatePosition == 0)
+                _moneyEstimateBasePrice = 0m;
+            else if (!sameDirection)
+                _moneyEstimateBasePrice = trade.Price;
+            else if (Math.Abs(_moneyEstimatePosition) > Math.Abs(previousPosition))
+            {
+                var addedQuantity = Math.Abs(_moneyEstimatePosition) - Math.Abs(previousPosition);
+                _moneyEstimateBasePrice =
+                    (_moneyEstimateBasePrice * Math.Abs(previousPosition) + trade.Price * addedQuantity) /
+                    Math.Abs(_moneyEstimatePosition);
+            }
+        }
+
+        private decimal GetDailyStrategyMoneyEstimate(decimal marketPrice)
+        {
+            var openMoney = _moneyEstimatePosition == 0 || _moneyEstimateBasePrice == 0
+                ? 0m
+                : (marketPrice - _moneyEstimateBasePrice) * _moneyEstimatePosition * PointValue;
+            return _dailyClosedPnlMoneyEstimate + openMoney - _dailyCommissionMoneyEstimate;
         }
 
         private string GetAccountStopOutcome()
