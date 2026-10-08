@@ -143,13 +143,10 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Use MACD filter", Description = "MACD filters new entries only: long when difference > 0, short when difference < 0. An opposite body engulfing always closes the current position, even when MACD disagrees.", Order = 201)]
         public bool UseMacdFilter { get; set; } = true;
 
-        [Display(GroupName = "07. Signal", Name = "Reverse on opposite engulfing", Description = "Close the current position on the opposite engulfing signal, then open in the new direction only after the close is filled. Disable TP/SL orders for this test.", Order = 202)]
-        public bool ReverseOnOppositeEngulfing { get; set; } = false;
-
         [Display(GroupName = "08. TP/SL", Name = "TP/SL mode", Order = 250)]
         public ProtectionMode ProtectionCalculationMode { get; set; } = ProtectionMode.Points;
 
-        [Display(GroupName = "08. TP/SL", Name = "Use TP/SL orders", Description = "Disable for the engulfing-to-engulfing reversal test. Without TP/SL, positions are closed by an opposite signal or a daily account limit.", Order = 251)]
+        [Display(GroupName = "08. TP/SL", Name = "Use TP/SL orders", Description = "When disabled, opposite body engulfing closes the position and may open the opposite direction after the close fill. MACD filters entries only.", Order = 251)]
         public bool UseProtectiveOrders { get; set; } = true;
 
         [Display(GroupName = "06. Series sizing", Name = "Series mode", Order = 160)]
@@ -326,10 +323,7 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; reverse_on_engulfing={ReverseOnOppositeEngulfing}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
-
-            if (ReverseOnOppositeEngulfing == UseProtectiveOrders)
-                RaiseShowNotification($"{GetInstanceLabel()}: несовместимые настройки выхода. Для переворота включите Reverse on opposite engulfing и выключите Use TP/SL orders; для обычной торговли — наоборот. Входы заблокированы.");
+                $"macd_filter={UseMacdFilter}; reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
         }
 
         protected override void OnStopping()
@@ -623,12 +617,6 @@ namespace CashReaper
                 return;
             }
 
-            if (ReverseOnOppositeEngulfing == UseProtectiveOrders)
-            {
-                RecordBarDecision(bar, null, null, 0, false, "", false, "exit_mode_configuration_invalid");
-                return;
-            }
-
             if (_pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
             {
                 RecordBarDecision(bar, null, null, 0, false, "", false, "protective_cancel_pending");
@@ -667,7 +655,7 @@ namespace CashReaper
 
             var activePosition = GetActivePosition();
 
-            if (ReverseOnOppositeEngulfing && activePosition != 0)
+            if (!UseProtectiveOrders && activePosition != 0)
             {
                 if ((bullishEngulfing && activePosition < 0) ||
                     (bearishEngulfing && activePosition > 0))
@@ -829,8 +817,8 @@ namespace CashReaper
                 return;
             }
 
-            if (accountLimitClosing || !TradingEnabled || !ReverseOnOppositeEngulfing ||
-                UseProtectiveOrders || _pendingCancelTakeProfitOrder != null ||
+            if (accountLimitClosing || !TradingEnabled || UseProtectiveOrders ||
+                _pendingCancelTakeProfitOrder != null ||
                 _pendingCancelStopLossOrder != null || !CheckAccountLimits(signalBar) ||
                 !IsWeekendTradingAllowed(CurrentBar - 1) || !IsTradingTimeAllowed(CurrentBar - 1))
             {
