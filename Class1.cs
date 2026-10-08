@@ -80,7 +80,7 @@ namespace CashReaper
         [Display(GroupName = "04. Time filter", Name = "Trade on Sunday", Description = "Allow new entries on Sunday in chart time. Existing positions remain protected.", Order = 82)]
         public bool TradeOnSunday { get; set; } = false;
 
-        [Display(GroupName = "05. Risk sizing", Name = "Calculate volume from risk", Description = "If enabled, volume = reference balance x risk percentage / (stop distance x point value). If disabled, Base volume is used.", Order = 120)]
+        [Display(GroupName = "05. Risk sizing", Name = "Calculate volume from risk", Description = "With TP/SL enabled, volume = reference balance x risk percentage / (stop distance x point value). Without a stop order, Base volume is used instead.", Order = 120)]
         public bool RiskSizingEnabled { get; set; } = false;
 
         [Display(GroupName = "05a. Daily profit limit", Name = "Enable profit limit", Description = "Stop new entries until the next chart day and close this strategy's position when the selected daily profit target is reached.", Order = 121)]
@@ -140,8 +140,17 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Range size", Order = 200)]
         public int RangeSize { get; set; } = 5;
 
+        [Display(GroupName = "07. Signal", Name = "Use MACD filter", Description = "When disabled, a body engulfing pattern alone produces a signal.", Order = 201)]
+        public bool UseMacdFilter { get; set; } = true;
+
+        [Display(GroupName = "07. Signal", Name = "Reverse on opposite engulfing", Description = "Close the current position on the opposite engulfing signal, then open in the new direction only after the close is filled. Disable TP/SL orders for this test.", Order = 202)]
+        public bool ReverseOnOppositeEngulfing { get; set; } = false;
+
         [Display(GroupName = "08. TP/SL", Name = "TP/SL mode", Order = 250)]
         public ProtectionMode ProtectionCalculationMode { get; set; } = ProtectionMode.Points;
+
+        [Display(GroupName = "08. TP/SL", Name = "Use TP/SL orders", Description = "Disable for the engulfing-to-engulfing reversal test. Without TP/SL, positions are closed by an opposite signal or a daily account limit.", Order = 251)]
+        public bool UseProtectiveOrders { get; set; } = true;
 
         [Display(GroupName = "06. Series sizing", Name = "Series mode", Order = 160)]
         public SeriesMode SeriesSizingMode { get; set; } = SeriesMode.Martingale;
@@ -232,6 +241,10 @@ namespace CashReaper
         private int _cancelRetryUntilBar = -1;
         private int _lastCancelRetryBar = -1;
         private int _lastAccountCloseAttemptBar = -1;
+        private int _lastReversalCloseAttemptBar = -1;
+        private int _pendingReversalBar = -1;
+        private OrderDirections _pendingReversalDirection;
+        private bool _reversalPending;
 
         private Order _entryOrder;
         private Order _emergencyOrder;
@@ -293,7 +306,7 @@ namespace CashReaper
                 RaiseShowNotification(
                     $"{GetInstanceLabel()}: запущен. Есть открытая позиция: {GetActivePosition()}. Новые входы заблокированы до закрытия позиции.");
 
-                if (RestoreProtectiveOrdersOnStart)
+                if (UseProtectiveOrders && RestoreProtectiveOrdersOnStart)
                     RestoreProtectionForExistingPosition();
             }
 
@@ -311,10 +324,17 @@ namespace CashReaper
                 TradingEnabled,
                 context,
                 0m);
+
+            RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
+                $"macd_filter={UseMacdFilter}; reverse_on_engulfing={ReverseOnOppositeEngulfing}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
+
+            if (ReverseOnOppositeEngulfing == UseProtectiveOrders)
+                RaiseShowNotification($"{GetInstanceLabel()}: несовместимые настройки выхода. Для переворота включите Reverse on opposite engulfing и выключите Use TP/SL orders; для обычной торговли — наоборот. Входы заблокированы.");
         }
 
         protected override void OnStopping()
         {
+            _reversalPending = false;
             CancelProtectiveOrders();
 
             if (GetActivePosition() == 0)
@@ -375,6 +395,7 @@ namespace CashReaper
             SyncPositionState(signalBar, "before_signal_check");
             RecoverAfterConnectionGap(signalBar);
             RetryProtectiveCancellation(signalBar);
+            RetryReversalClose(signalBar);
             CheckSignal(signalBar);
             SyncPositionState(signalBar, "after_signal_check");
         }
@@ -417,7 +438,7 @@ namespace CashReaper
                 return;
             }
 
-            if (GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent)
+            if (UseProtectiveOrders && GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent)
             {
                 RaiseDebug("Позиция есть, но защитные заявки ещё не активны. Проверяю защиту.");
                 PlaceProtectiveOrders();
@@ -476,6 +497,14 @@ namespace CashReaper
                 $"{myTrade}; previous={previousPosition}; tracked={_trackedPosition}; current={CurrentPosition}; last_pnl_points={_lastTradePnlPoints}; total_pnl_points={_totalPnlPoints}",
                 myTrade.Volume);
 
+            // A terminal order callback may precede MyTrade and clear _emergencyClosing.
+            // The reversal is nevertheless completed only after the closing fill is observed.
+            if (_reversalPending && activePosition == 0)
+            {
+                CompleteReversalAfterFill();
+                return;
+            }
+
             if (_emergencyClosing)
             {
                 if (activePosition == 0)
@@ -523,7 +552,7 @@ namespace CashReaper
                 return;
             }
 
-            if (previousPosition != 0 && activePosition == 0 && _entrySent)
+            if (previousPosition != 0 && activePosition == 0 && _entrySent && !_reversalPending)
                 HandleTradeClosed(GetTradeCloseOutcome(myTrade));
         }
 
@@ -588,6 +617,18 @@ namespace CashReaper
 
         private void CheckSignal(int bar)
         {
+            if (_reversalPending)
+            {
+                RecordBarDecision(bar, null, null, 0, false, "", false, "reversal_close_pending");
+                return;
+            }
+
+            if (ReverseOnOppositeEngulfing == UseProtectiveOrders)
+            {
+                RecordBarDecision(bar, null, null, 0, false, "", false, "exit_mode_configuration_invalid");
+                return;
+            }
+
             if (_pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
             {
                 RecordBarDecision(bar, null, null, 0, false, "", false, "protective_cancel_pending");
@@ -595,35 +636,9 @@ namespace CashReaper
                 return;
             }
 
-            if (bar <= _entriesBlockedUntilBar)
-            {
-                RecordBarDecision(bar, null, null, 0, false, "", false, "post_close_cooldown");
-                RaiseDebug($"Вход заблокирован паузой после закрытия. Bar={bar}; BlockedUntil={_entriesBlockedUntilBar}");
-                return;
-            }
-
-            if (_tradeState != TradeState.Idle || _entrySent || GetActivePosition() != 0)
-            {
-                RaiseDebug(
-                    $"Вход заблокирован. Bar={bar}; State={_tradeState}; EntrySent={_entrySent}; Position={GetActivePosition()}");
-                return;
-            }
-
-            if (!IsWeekendTradingAllowed(CurrentBar - 1))
-            {
-                RecordBarDecision(bar, null, null, 0, false, "", false, "weekend_disabled");
-                return;
-            }
-
             if (!CheckAccountLimits(bar))
             {
                 RecordBarDecision(bar, null, null, 0, false, "", false, GetAccountStopOutcome());
-                return;
-            }
-
-            if (!IsTradingTimeAllowed(CurrentBar - 1))
-            {
-                RecordBarDecision(bar, null, null, 0, false, "", false, "time_limit");
                 return;
             }
 
@@ -641,13 +656,47 @@ namespace CashReaper
                 currentBullish &&
                 previousBearish &&
                 engulf &&
-                diff > 0;
+                (!UseMacdFilter || diff > 0);
 
             var isShort =
                 currentBearish &&
                 previousBullish &&
                 engulf &&
-                diff < 0;
+                (!UseMacdFilter || diff < 0);
+
+            var desiredDirection = isLong ? OrderDirections.Buy : OrderDirections.Sell;
+            var activePosition = GetActivePosition();
+
+            if (ReverseOnOppositeEngulfing && activePosition != 0)
+            {
+                if ((isLong && activePosition < 0) || (isShort && activePosition > 0))
+                {
+                    RecordBarDecision(bar, current, previous, diff, engulf, isLong ? "LONG" : "SHORT", true, "reversal_signal");
+                    BeginReversal(desiredDirection, bar);
+                }
+                return;
+            }
+
+            if (bar <= _entriesBlockedUntilBar)
+            {
+                RecordBarDecision(bar, current, previous, diff, engulf, "", false, "post_close_cooldown");
+                return;
+            }
+
+            if (_tradeState != TradeState.Idle || _entrySent || activePosition != 0)
+                return;
+
+            if (!IsWeekendTradingAllowed(CurrentBar - 1))
+            {
+                RecordBarDecision(bar, current, previous, diff, engulf, "", false, "weekend_disabled");
+                return;
+            }
+
+            if (!IsTradingTimeAllowed(CurrentBar - 1))
+            {
+                RecordBarDecision(bar, current, previous, diff, engulf, "", false, "time_limit");
+                return;
+            }
 
             if (isLong)
             {
@@ -690,8 +739,8 @@ namespace CashReaper
                 $"Close={signalCandle.Close}; " +
                 $"Difference={diff}; " +
                 $"Volume={_activeVolume}; " +
-                $"TP={_takeProfitPrice}; " +
-                $"SL={_stopLossPrice}; " +
+                $"TP={(UseProtectiveOrders ? _takeProfitPrice.ToString() : "off")}; " +
+                $"SL={(UseProtectiveOrders ? _stopLossPrice.ToString() : "off")}; " +
                 $"TPPoints={TakeProfitPoints}; " +
                 $"SLPoints={StopLossPoints}; " +
                 $"ProtectionMode={ProtectionCalculationMode}; " +
@@ -710,6 +759,78 @@ namespace CashReaper
                 return;
 
             SendEntryOrder(direction);
+        }
+
+        private void BeginReversal(OrderDirections direction, int bar)
+        {
+            if (!TradingEnabled || _reversalPending || _emergencyClosing || _accountStopClosing)
+                return;
+
+            _pendingReversalDirection = direction;
+            _pendingReversalBar = bar;
+            _reversalPending = true;
+            _lastReversalCloseAttemptBar = bar;
+            RecordTradeEvent("reversal_close_requested", bar, direction.ToString(), true,
+                $"from_position={GetActivePosition()}; to_direction={direction}", Math.Abs(GetActivePosition()));
+
+            // Settings may have been changed while a protected position was open.
+            // Never race an existing TP/SL order against the reversal close.
+            if (_takeProfitOrder != null || _stopLossOrder != null)
+            {
+                CancelProtectiveOrders();
+                if (_pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
+                    return;
+            }
+
+            EmergencyFlattenPosition("engulfing_reversal");
+        }
+
+        private void RetryReversalClose(int bar)
+        {
+            if (!_reversalPending || _emergencyClosing || GetActivePosition() == 0 ||
+                _pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null ||
+                bar <= _lastReversalCloseAttemptBar)
+                return;
+
+            _lastReversalCloseAttemptBar = bar;
+            EmergencyFlattenPosition("engulfing_reversal_retry");
+        }
+
+        private void CompleteReversalAfterFill()
+        {
+            var direction = _pendingReversalDirection;
+            var signalBar = _pendingReversalBar;
+            RecordTradeClosed("engulfing_reversal");
+            RecordTradeEvent("reversal_close_filled", signalBar, direction.ToString(), true,
+                $"last_pnl_points={_lastTradePnlPoints}; position={GetActivePosition()}", 0m);
+
+            if (_lastTradePnlPoints > 0)
+                _lossSeriesStep = 0;
+            else if (_lastTradePnlPoints < 0)
+                _lossSeriesStep = Math.Min(Math.Max(MaxSeriesStep, 1), _lossSeriesStep + 1);
+
+            var accountLimitClosing = _accountStopClosing;
+            if (accountLimitClosing)
+                RecordTradeClosed(GetAccountStopOutcome());
+
+            _reversalPending = false;
+            _pendingReversalBar = -1;
+            ResetTradeState();
+
+            if (accountLimitClosing || !TradingEnabled || !ReverseOnOppositeEngulfing ||
+                UseProtectiveOrders || _pendingCancelTakeProfitOrder != null ||
+                _pendingCancelStopLossOrder != null || !CheckAccountLimits(signalBar) ||
+                !IsWeekendTradingAllowed(CurrentBar - 1) || !IsTradingTimeAllowed(CurrentBar - 1))
+            {
+                RecordTradeEvent("reversal_entry_blocked", signalBar, direction.ToString(), false,
+                    "trading_or_limit_or_schedule_or_protective_cancel", 0m);
+                return;
+            }
+
+            RecordTradeEvent("reversal_entry_requested", signalBar, direction.ToString(), true,
+                "close_fill_confirmed", 0m);
+            ProcessSignal(direction, direction == OrderDirections.Buy ? "LONG" : "SHORT",
+                signalBar, _difference[signalBar]);
         }
 
         private void SendEntryOrder(OrderDirections direction)
@@ -777,7 +898,7 @@ namespace CashReaper
 
         private void HandleEntryFilled()
         {
-            if (_protectivePlacementStarted || _emergencyClosing)
+            if (_protectivePlacementStarted || _emergencyClosing || _tradeState == TradeState.PositionOpen)
                 return;
 
             var activePosition = GetActivePosition();
@@ -787,13 +908,18 @@ namespace CashReaper
             RecordTradeEvent("entry_filled", _lastProcessedSignalBar, _entryDirection.ToString(), true, "position_open", Math.Abs(activePosition));
 
             RaiseShowNotification(
-                $"{GetInstanceLabel()}: вход исполнен. Position={activePosition}; TP={_takeProfitPrice}; SL={_stopLossPrice}");
+                UseProtectiveOrders
+                    ? $"{GetInstanceLabel()}: вход исполнен. Position={activePosition}; TP={_takeProfitPrice}; SL={_stopLossPrice}"
+                    : $"{GetInstanceLabel()}: вход исполнен. Position={activePosition}; TP/SL отключены; выход по противоположному поглощению.");
 
-            PlaceProtectiveOrders();
+            if (UseProtectiveOrders)
+                PlaceProtectiveOrders();
         }
 
         private void PlaceProtectiveOrders()
         {
+            if (!UseProtectiveOrders)
+                return;
             // OnOrderChanged can be called synchronously from OpenOrder. Never create
             // another pair while the first pair is being registered.
             if (_protectivePlacementStarted || _emergencyClosing)
@@ -899,7 +1025,7 @@ namespace CashReaper
             if (!AutoRecoveryEnabled)
                 return;
 
-            if (GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent)
+            if (UseProtectiveOrders && GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent)
             {
                 if (_lastProtectiveRetryBar >= 0 &&
                     signalBar - _lastProtectiveRetryBar < ProtectiveRetryBars)
@@ -921,7 +1047,7 @@ namespace CashReaper
                 return;
             }
 
-            if (!_entrySent || _protectiveOrdersSent || GetActivePosition() != 0 || _entrySentBar < 0)
+            if (_reversalPending || !_entrySent || _protectiveOrdersSent || GetActivePosition() != 0 || _entrySentBar < 0)
                 return;
 
             if (signalBar - _entrySentBar < EntryRecoveryBars)
@@ -1035,7 +1161,7 @@ namespace CashReaper
         {
             var baseVolume = Volume;
 
-            if (RiskSizingEnabled && DepositReferenceValue > 0 && RiskPerTradeDepositPercent > 0 && PointValue > 0 && stopDistance > 0)
+            if (UseProtectiveOrders && RiskSizingEnabled && DepositReferenceValue > 0 && RiskPerTradeDepositPercent > 0 && PointValue > 0 && stopDistance > 0)
             {
                 var riskMoney = DepositReferenceValue * RiskPerTradeDepositPercent / 100m;
                 baseVolume = riskMoney / (stopDistance * PointValue);
@@ -1222,7 +1348,9 @@ namespace CashReaper
                     reason,
                     Math.Abs(activePosition));
 
-                RaiseShowNotification(reason == "account_profit_target" || reason == "account_loss_limit"
+                RaiseShowNotification(reason.StartsWith("engulfing_reversal")
+                    ? $"{GetInstanceLabel()}: противоположное поглощение. Закрываю текущую позицию {closeDirection}; Volume={Math.Abs(activePosition)}."
+                    : reason == "account_profit_target" || reason == "account_loss_limit"
                     ? $"{GetInstanceLabel()}: дневной денежный лимит счёта достигнут. Отправлено досрочное закрытие {closeDirection}; Volume={Math.Abs(activePosition)}."
                     : $"{GetInstanceLabel()}: обнаружено исполнение без активной сделки стратегии. Отправляю аварийное закрытие {closeDirection}; Volume={Math.Abs(activePosition)}.");
             }
@@ -1365,7 +1493,7 @@ namespace CashReaper
                 return;
             }
 
-            if (previousPosition != 0 && activePosition == 0 && _entrySent)
+            if (previousPosition != 0 && activePosition == 0 && _entrySent && !_reversalPending)
                 HandleTradeClosed(reason);
         }
 
@@ -1415,13 +1543,13 @@ namespace CashReaper
             if (!engulf)
                 return "no_body_engulf";
 
-            if (diff == 0)
+            if (UseMacdFilter && diff == 0)
                 return "macd_zero";
 
-            if (currentBullish && previousBearish && diff <= 0)
+            if (UseMacdFilter && currentBullish && previousBearish && diff <= 0)
                 return "long_macd_filter";
 
-            if (currentBearish && previousBullish && diff >= 0)
+            if (UseMacdFilter && currentBearish && previousBullish && diff >= 0)
                 return "short_macd_filter";
 
             if (!currentBullish && !currentBearish)
