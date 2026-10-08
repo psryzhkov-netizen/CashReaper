@@ -69,7 +69,7 @@ namespace CashReaper
         [Display(GroupName = "03. Recovery", Name = "Post-close cooldown bars", Order = 101)]
         public int PostCloseCooldownBars { get; set; } = 2;
 
-        [Display(GroupName = "03. Recovery", Name = "Protective cancel retry bars", Order = 102)]
+        [Display(GroupName = "03. Recovery", Name = "Protective cancel warning bars", Order = 102)]
         public int ProtectiveCancelRetryBars { get; set; } = 5;
 
         [Display(GroupName = "04. Time filter", Name = "Pause start hour", Order = 110)]
@@ -180,6 +180,8 @@ namespace CashReaper
 
         private bool _entrySent;
         private bool _protectiveOrdersSent;
+        private bool _protectivePlacementStarted;
+        private bool _closingTrade;
         private bool _tradingStoppedByTime;
         private bool _emergencyClosing;
 
@@ -249,12 +251,12 @@ namespace CashReaper
             if (GetActivePosition() == 0)
             {
                 ResetTradeState();
-                RaiseShowNotification($"{GetInstanceLabel()}: остановлен. Позиции нет, состояние сброшено.");
+                RaiseShowNotification($"{GetInstanceLabel()}: остановлен. Позиции нет; проверьте подтверждение отмены защитных заявок в ATAS.");
             }
             else
             {
                 RaiseShowNotification(
-                    $"{GetInstanceLabel()}: остановлен. Внимание: позиция всё ещё открыта: {GetActivePosition()}. Защитные заявки стратегии сняты.");
+                    $"{GetInstanceLabel()}: остановлен. Внимание: позиция всё ещё открыта: {GetActivePosition()}. Отмена защитных заявок запрошена, но не подтверждена.");
             }
 
             base.OnStopping();
@@ -310,9 +312,10 @@ namespace CashReaper
                 return;
 
             RecordOrderEvent(order, "order_changed", "atas_order_changed");
+            UpdateProtectiveOrderState(order);
             SyncPositionState(_lastProcessedSignalBar, "order_changed");
 
-            if (_entryOrder != null && order.Id == _entryOrder.Id)
+            if (IsMatchingOrder(_entryOrder, order))
             {
                 if (GetActivePosition() != 0 && !_protectiveOrdersSent)
                     HandleEntryFilled();
@@ -320,13 +323,13 @@ namespace CashReaper
                 return;
             }
 
-            if (_takeProfitOrder != null && order.Id == _takeProfitOrder.Id && GetActivePosition() == 0)
+            if (IsMatchingOrder(_takeProfitOrder, order) && GetActivePosition() == 0)
             {
                 HandleTradeClosed("TP");
                 return;
             }
 
-            if (_stopLossOrder != null && order.Id == _stopLossOrder.Id && GetActivePosition() == 0)
+            if (IsMatchingOrder(_stopLossOrder, order) && GetActivePosition() == 0)
             {
                 HandleTradeClosed("SL");
                 return;
@@ -437,13 +440,36 @@ namespace CashReaper
 
             RecordOrderEvent(order, "order_register_failed", message);
 
-            if (_entryOrder != null && order.Id == _entryOrder.Id)
+            if (IsMatchingOrder(_entryOrder, order))
             {
                 ResetTradeState();
                 RaiseShowNotification(
                     $"{GetInstanceLabel()}: входная заявка отклонена. {message}");
                 return;
             }
+
+            var takeProfitFailed = IsMatchingOrder(_takeProfitOrder, order);
+            var stopLossFailed = IsMatchingOrder(_stopLossOrder, order);
+
+            if (takeProfitFailed || stopLossFailed)
+            {
+                if (takeProfitFailed)
+                    _takeProfitOrder = null;
+
+                if (stopLossFailed)
+                    _stopLossOrder = null;
+
+                CancelProtectiveOrders();
+                RaiseShowNotification($"{GetInstanceLabel()}: защитная заявка отклонена. Закрываю позицию аварийно. {message}");
+                EmergencyFlattenPosition("protective_order_rejected");
+                return;
+            }
+
+            if (IsMatchingOrder(_pendingCancelTakeProfitOrder, order))
+                _pendingCancelTakeProfitOrder = null;
+
+            if (IsMatchingOrder(_pendingCancelStopLossOrder, order))
+                _pendingCancelStopLossOrder = null;
 
             RaiseShowNotification(
                 $"{GetInstanceLabel()}: заявка отклонена. {message}");
@@ -460,10 +486,10 @@ namespace CashReaper
 
         private void CheckSignal(int bar)
         {
-            if ((_pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null) && bar <= _cancelRetryUntilBar)
+            if (_pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
             {
                 RecordBarDecision(bar, null, null, 0, false, "", false, "protective_cancel_pending");
-                RaiseDebug($"Вход заблокирован до завершения повторной отмены защитных заявок. Bar={bar}; RetryUntil={_cancelRetryUntilBar}");
+                RaiseDebug($"Вход заблокирован до подтверждения отмены защитных заявок. Bar={bar}");
                 return;
             }
 
@@ -637,6 +663,9 @@ namespace CashReaper
 
         private void HandleEntryFilled()
         {
+            if (_protectivePlacementStarted || _emergencyClosing)
+                return;
+
             var activePosition = GetActivePosition();
 
             _tradeState = TradeState.PositionOpen;
@@ -651,10 +680,17 @@ namespace CashReaper
 
         private void PlaceProtectiveOrders()
         {
+            // OnOrderChanged can be called synchronously from OpenOrder. Never create
+            // another pair while the first pair is being registered.
+            if (_protectivePlacementStarted || _emergencyClosing)
+                return;
+
             var activePosition = GetActivePosition();
 
             if (activePosition == 0)
                 return;
+
+            _protectivePlacementStarted = true;
 
             var exitDirection = GetExitDirectionForCurrentPosition();
             var quantity = Math.Abs(activePosition);
@@ -669,6 +705,15 @@ namespace CashReaper
                 QuantityToFill = quantity
             };
 
+            _lastProtectiveRetryBar = _lastProcessedSignalBar;
+
+            var takeProfitSent = TryOpenOrder(_takeProfitOrder, "take-profit");
+            if (!takeProfitSent || _emergencyClosing || GetActivePosition() == 0)
+            {
+                FailProtectivePlacement();
+                return;
+            }
+
             _stopLossOrder = new Order
             {
                 Portfolio = Portfolio,
@@ -680,10 +725,12 @@ namespace CashReaper
                 QuantityToFill = quantity
             };
 
-            _lastProtectiveRetryBar = _lastProcessedSignalBar;
-
-            var takeProfitSent = TryOpenOrder(_takeProfitOrder, "take-profit");
             var stopLossSent = TryOpenOrder(_stopLossOrder, "stop-loss");
+            if (!stopLossSent || _emergencyClosing || GetActivePosition() == 0)
+            {
+                FailProtectivePlacement();
+                return;
+            }
 
             _protectiveOrdersSent = takeProfitSent && stopLossSent;
             _tradeState = _protectiveOrdersSent
@@ -698,15 +745,18 @@ namespace CashReaper
                 _protectiveOrdersSent ? "tp_sl_sent" : "tp_sl_partial",
                 quantity);
 
-            if (!_protectiveOrdersSent)
-            {
-                RaiseShowNotification(
-                    $"{GetInstanceLabel()}: позиция есть, но защитные заявки выставились не полностью. Буду пробовать повторно.");
-                return;
-            }
-
             RaiseShowNotification(
                 $"{GetInstanceLabel()}: защитные заявки выставлены. TP={_takeProfitPrice}; SL={_stopLossPrice}");
+        }
+
+        private void FailProtectivePlacement()
+        {
+            if (_emergencyClosing)
+                return;
+
+            CancelProtectiveOrders();
+            RaiseShowNotification($"{GetInstanceLabel()}: защитные заявки не подтверждены. Закрываю позицию аварийно.");
+            EmergencyFlattenPosition("protective_order_not_sent");
         }
 
         private void RestoreProtectionForExistingPosition()
@@ -772,6 +822,10 @@ namespace CashReaper
 
         private void HandleTradeClosed(string outcome)
         {
+            if (_closingTrade)
+                return;
+
+            _closingTrade = true;
             CancelProtectiveOrders();
             _entriesBlockedUntilBar = Math.Max(_entriesBlockedUntilBar, _lastProcessedSignalBar + Math.Max(PostCloseCooldownBars, 1));
 
@@ -791,6 +845,10 @@ namespace CashReaper
 
         private void HandleProtectiveOverfill(MyTrade myTrade, decimal previousPosition, decimal activePosition)
         {
+            if (_closingTrade)
+                return;
+
+            _closingTrade = true;
             CancelProtectiveOrders();
             _entriesBlockedUntilBar = Math.Max(_entriesBlockedUntilBar, _lastProcessedSignalBar + Math.Max(PostCloseCooldownBars, 1));
 
@@ -951,7 +1009,37 @@ namespace CashReaper
             if (order == null || myTrade == null)
                 return false;
 
-            return Convert.ToString(order.Id, CultureInfo.InvariantCulture) == myTrade.OrderId;
+            return !string.IsNullOrEmpty(order.Id) && order.Id == myTrade.OrderId;
+        }
+
+        private static bool IsMatchingOrder(Order tracked, Order update)
+        {
+            return tracked != null && update != null &&
+                (ReferenceEquals(tracked, update) ||
+                 (!string.IsNullOrEmpty(tracked.Id) && tracked.Id == update.Id));
+        }
+
+        private static bool IsTerminalOrder(Order order)
+        {
+            return order.State == OrderStates.Done || order.State == OrderStates.Failed;
+        }
+
+        private void UpdateProtectiveOrderState(Order order)
+        {
+            if (IsMatchingOrder(_takeProfitOrder, order))
+                _takeProfitOrder = order;
+
+            if (IsMatchingOrder(_stopLossOrder, order))
+                _stopLossOrder = order;
+
+            if (IsMatchingOrder(_pendingCancelTakeProfitOrder, order))
+                _pendingCancelTakeProfitOrder = IsTerminalOrder(order) ? null : order;
+
+            if (IsMatchingOrder(_pendingCancelStopLossOrder, order))
+                _pendingCancelStopLossOrder = IsTerminalOrder(order) ? null : order;
+
+            if (_pendingCancelTakeProfitOrder == null && _pendingCancelStopLossOrder == null)
+                _cancelRetryUntilBar = -1;
         }
 
         private decimal CalculateClosedTradePnlPoints(decimal position, decimal entryPrice, decimal exitPrice)
@@ -978,6 +1066,9 @@ namespace CashReaper
 
         private void EmergencyFlattenPosition(string reason)
         {
+            if (_emergencyClosing)
+                return;
+
             var activePosition = GetActivePosition();
 
             if (activePosition == 0)
@@ -1051,14 +1142,14 @@ namespace CashReaper
 
         private void CancelProtectiveOrders()
         {
-            if (_takeProfitOrder != null)
+            if (_takeProfitOrder != null && !IsTerminalOrder(_takeProfitOrder))
                 _pendingCancelTakeProfitOrder = _takeProfitOrder;
 
-            if (_stopLossOrder != null)
+            if (_stopLossOrder != null && !IsTerminalOrder(_stopLossOrder))
                 _pendingCancelStopLossOrder = _stopLossOrder;
 
-            TryCancelOrder(_takeProfitOrder);
-            TryCancelOrder(_stopLossOrder);
+            TryCancelOrder(_pendingCancelTakeProfitOrder);
+            TryCancelOrder(_pendingCancelStopLossOrder);
 
             if (_pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
             {
@@ -1076,19 +1167,16 @@ namespace CashReaper
             if (_pendingCancelTakeProfitOrder == null && _pendingCancelStopLossOrder == null)
                 return;
 
-            if (signalBar > _cancelRetryUntilBar)
-            {
-                _pendingCancelTakeProfitOrder = null;
-                _pendingCancelStopLossOrder = null;
-                _cancelRetryUntilBar = -1;
-                _lastCancelRetryBar = -1;
-                return;
-            }
-
             if (signalBar <= _lastCancelRetryBar)
                 return;
 
             _lastCancelRetryBar = signalBar;
+
+            if (_cancelRetryUntilBar >= 0 && signalBar >= _cancelRetryUntilBar)
+            {
+                RaiseShowNotification($"{GetInstanceLabel()}: отмена защитной заявки не подтверждена ATAS. Новые входы заблокированы; проверьте заявки вручную.");
+                _cancelRetryUntilBar = -1;
+            }
 
             TryCancelOrder(_pendingCancelTakeProfitOrder, "protective_cancel_retry");
             TryCancelOrder(_pendingCancelStopLossOrder, "protective_cancel_retry");
@@ -1096,13 +1184,13 @@ namespace CashReaper
 
         private void TryCancelOrder(Order order, string eventType = "protective_cancel_requested")
         {
-            if (order == null)
+            if (order == null || IsTerminalOrder(order))
                 return;
 
             try
             {
                 CancelOrder(order);
-                RecordOrderEvent(order, eventType, "cancel_order_ok");
+                RecordOrderEvent(order, eventType, "cancel_request_sent");
             }
             catch (Exception ex)
             {
@@ -1169,6 +1257,8 @@ namespace CashReaper
             _tradeState = TradeState.Idle;
             _entrySent = false;
             _protectiveOrdersSent = false;
+            _protectivePlacementStarted = false;
+            _closingTrade = false;
             _tradingStoppedByTime = false;
             _emergencyClosing = false;
             _entrySentBar = -1;
@@ -1341,7 +1431,7 @@ namespace CashReaper
                 _lastProcessedSignalBar,
                 order.Direction.ToString(),
                 eventType.IndexOf("error", StringComparison.OrdinalIgnoreCase) < 0,
-                reason,
+                $"{reason}; order_id={order.Id}; order_state={order.State}",
                 order.QuantityToFill);
         }
 
