@@ -17,6 +17,13 @@ namespace CashReaper
             ProtectiveOrdersActive
         }
 
+        private enum AccountStopReason
+        {
+            None,
+            Profit,
+            Loss
+        }
+
         public enum ProtectionMode
         {
             Points = 0,
@@ -68,6 +75,12 @@ namespace CashReaper
 
         [Display(GroupName = "05. Risk sizing", Name = "Daily account profit target (account currency)", Description = "Positive amount in the account currency. Compared with ClosedPnL + OpenPnL of the whole selected account as reported by ATAS.", Order = 122)]
         public decimal AccountProfitTarget { get; set; } = 0m;
+
+        [Display(GroupName = "05. Risk sizing", Name = "Stop at daily account loss", Description = "Use the selected account's closed plus open PnL. On reaching the loss limit, close this strategy's position, cancel its TP/SL and block new entries until the next chart day.", Order = 123)]
+        public bool AccountLossLimitEnabled { get; set; } = false;
+
+        [Display(GroupName = "05. Risk sizing", Name = "Daily account loss limit (account currency)", Description = "Enter a positive loss amount in the account currency, for example 10 for -10 USDT. Compared with ClosedPnL + OpenPnL of the whole selected account.", Order = 124)]
+        public decimal AccountLossLimit { get; set; } = 0m;
 
         [Display(GroupName = "06. Series sizing", Name = "Use series sizing", Order = 150)]
         public bool SeriesSizingEnabled { get; set; } = false;
@@ -177,11 +190,11 @@ namespace CashReaper
         private int _entrySentBar = -1;
         private int _lastProtectiveRetryBar = -1;
         private DateTime _lastTimeLimitNoticeDate = DateTime.MinValue;
-        private DateTime _accountProfitBlockedDate = DateTime.MinValue;
+        private DateTime _accountStopBlockedDate = DateTime.MinValue;
         private int _entriesBlockedUntilBar = -1;
         private int _cancelRetryUntilBar = -1;
         private int _lastCancelRetryBar = -1;
-        private int _lastProfitCloseAttemptBar = -1;
+        private int _lastAccountCloseAttemptBar = -1;
 
         private Order _entryOrder;
         private Order _emergencyOrder;
@@ -198,8 +211,9 @@ namespace CashReaper
         private bool _protectivePlacementStarted;
         private bool _closingTrade;
         private bool _tradingStoppedByTime;
-        private bool _accountProfitTargetNotified;
-        private bool _accountProfitClosing;
+        private bool _accountLimitInvalidNotified;
+        private bool _accountStopClosing;
+        private AccountStopReason _accountStopReason;
         private bool _emergencyClosing;
 
         private decimal _takeProfitPrice;
@@ -249,8 +263,8 @@ namespace CashReaper
 
             RaiseShowNotification(
                 TradingEnabled
-                    ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; AccountProfitTarget={AccountProfitTargetEnabled}/{AccountProfitTarget}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}"
-                    : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; AccountProfitTarget={AccountProfitTargetEnabled}/{AccountProfitTarget}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}");
+                    ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; AccountProfitTarget={AccountProfitTargetEnabled}/{AccountProfitTarget}; AccountLossLimit={AccountLossLimitEnabled}/{AccountLossLimit}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}"
+                    : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; AccountProfitTarget={AccountProfitTargetEnabled}/{AccountProfitTarget}; AccountLossLimit={AccountLossLimitEnabled}/{AccountLossLimit}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}");
 
             RecordTradeEvent(
                 "strategy_started",
@@ -310,7 +324,7 @@ namespace CashReaper
                 return;
 
             // Account OpenPnL changes on every price update, not only once per bar.
-            CheckAccountProfitTarget(bar);
+            CheckAccountLimits(bar);
 
             var signalBar = bar - 1;
 
@@ -426,8 +440,8 @@ namespace CashReaper
                         myTrade.ToString(),
                         myTrade.Volume);
 
-                    if (_accountProfitClosing)
-                        RecordTradeClosed("account_profit_target");
+                    if (_accountStopClosing)
+                        RecordTradeClosed(GetAccountStopOutcome());
 
                     ResetTradeState();
                 }
@@ -553,9 +567,9 @@ namespace CashReaper
                 return;
             }
 
-            if (!CheckAccountProfitTarget(bar))
+            if (!CheckAccountLimits(bar))
             {
-                RecordBarDecision(bar, null, null, 0, false, "", false, "account_profit_target");
+                RecordBarDecision(bar, null, null, 0, false, "", false, GetAccountStopOutcome());
                 return;
             }
 
@@ -1158,8 +1172,8 @@ namespace CashReaper
                     reason,
                     Math.Abs(activePosition));
 
-                RaiseShowNotification(reason == "account_profit_target"
-                    ? $"{GetInstanceLabel()}: лимит прибыли счёта достигнут. Отправлено досрочное закрытие {closeDirection}; Volume={Math.Abs(activePosition)}."
+                RaiseShowNotification(reason == "account_profit_target" || reason == "account_loss_limit"
+                    ? $"{GetInstanceLabel()}: дневной денежный лимит счёта достигнут. Отправлено досрочное закрытие {closeDirection}; Volume={Math.Abs(activePosition)}."
                     : $"{GetInstanceLabel()}: обнаружено исполнение без активной сделки стратегии. Отправляю аварийное закрытие {closeDirection}; Volume={Math.Abs(activePosition)}.");
             }
             catch (Exception ex)
@@ -1318,12 +1332,12 @@ namespace CashReaper
             _protectiveOrdersSent = false;
             _protectivePlacementStarted = false;
             _closingTrade = false;
-            _accountProfitClosing = false;
+            _accountStopClosing = false;
             _tradingStoppedByTime = false;
             _emergencyClosing = false;
             _entrySentBar = -1;
             _lastProtectiveRetryBar = -1;
-            _lastProfitCloseAttemptBar = -1;
+            _lastAccountCloseAttemptBar = -1;
             _trackedPosition = CurrentPosition;
             _lastKnownPosition = GetActivePosition();
 
@@ -1607,98 +1621,119 @@ namespace CashReaper
                    (day != DayOfWeek.Sunday || TradeOnSunday);
         }
 
-        private bool CheckAccountProfitTarget(int bar)
+        private bool CheckAccountLimits(int bar)
         {
-            if (_accountProfitClosing)
+            if (_accountStopClosing)
             {
-                ClosePositionForAccountProfitTarget();
-                if (_accountProfitClosing)
+                ClosePositionForAccountLimit();
+                if (_accountStopClosing)
                     return false;
             }
 
-            if (!AccountProfitTargetEnabled)
+            if (!AccountProfitTargetEnabled && !AccountLossLimitEnabled)
             {
-                _accountProfitTargetNotified = false;
-                _accountProfitBlockedDate = DateTime.MinValue;
+                _accountLimitInvalidNotified = false;
+                _accountStopBlockedDate = DateTime.MinValue;
+                _accountStopReason = AccountStopReason.None;
                 return true;
             }
 
             var chartDate = GetTerminalTime(CurrentBar - 1).Date;
-            if (_accountProfitBlockedDate == chartDate)
+            if (_accountStopBlockedDate == chartDate)
                 return false;
 
-            if (_accountProfitBlockedDate != DateTime.MinValue)
+            if (_accountStopBlockedDate != DateTime.MinValue)
             {
-                _accountProfitBlockedDate = DateTime.MinValue;
-                _accountProfitTargetNotified = false;
+                _accountStopBlockedDate = DateTime.MinValue;
+                _accountStopReason = AccountStopReason.None;
             }
 
-            if (Portfolio == null || AccountProfitTarget <= 0)
+            if (Portfolio == null ||
+                (AccountProfitTargetEnabled && AccountProfitTarget <= 0) ||
+                (AccountLossLimitEnabled && AccountLossLimit <= 0))
             {
-                if (!_accountProfitTargetNotified)
+                if (!_accountLimitInvalidNotified)
                 {
-                    _accountProfitTargetNotified = true;
-                    RaiseShowNotification($"{GetInstanceLabel()}: лимит прибыли счёта включён, но счёт не выбран или сумма лимита не больше нуля. Новые входы заблокированы.");
+                    _accountLimitInvalidNotified = true;
+                    RaiseShowNotification($"{GetInstanceLabel()}: денежный лимит счёта включён, но счёт не выбран или сумма включённого лимита не больше нуля. Новые входы заблокированы.");
                 }
 
                 return false;
             }
 
+            _accountLimitInvalidNotified = false;
             var closedPnl = Portfolio.ClosedPnL;
             var openPnl = Portfolio.OpenPnL;
             var accountPnl = closedPnl + openPnl;
-            if (accountPnl < AccountProfitTarget)
+            var reason = AccountStopReason.None;
+
+            if (AccountProfitTargetEnabled && accountPnl >= AccountProfitTarget)
+                reason = AccountStopReason.Profit;
+            else if (AccountLossLimitEnabled && accountPnl <= -AccountLossLimit)
+                reason = AccountStopReason.Loss;
+
+            if (reason == AccountStopReason.None)
                 return true;
 
-            _accountProfitBlockedDate = chartDate;
+            _accountStopBlockedDate = chartDate;
+            _accountStopReason = reason;
 
-            if (!_accountProfitTargetNotified)
-            {
-                _accountProfitTargetNotified = true;
-                RecordTradeEvent("account_profit_target_reached", bar, "", false,
-                    $"closed_pnl={closedPnl}; open_pnl={openPnl}; account_pnl={accountPnl}; target={AccountProfitTarget}; currency={Portfolio.Currency}", 0m);
-                RaiseShowNotification($"{GetInstanceLabel()}: дневной лимит прибыли счёта достигнут: {accountPnl} из {AccountProfitTarget} {Portfolio.Currency} (закрытая {closedPnl}, открытая {openPnl}). Новые входы остановлены до следующего дня.");
-            }
+            var limit = reason == AccountStopReason.Profit ? AccountProfitTarget : AccountLossLimit;
+            RecordTradeEvent(reason == AccountStopReason.Profit ? "account_profit_target_reached" : "account_loss_limit_reached",
+                bar, "", false,
+                $"closed_pnl={closedPnl}; open_pnl={openPnl}; account_pnl={accountPnl}; limit={limit}; currency={Portfolio.Currency}", 0m);
+            RaiseShowNotification($"{GetInstanceLabel()}: дневной лимит {(reason == AccountStopReason.Profit ? "прибыли" : "убытка")} счёта достигнут: {accountPnl} {Portfolio.Currency} (закрытая {closedPnl}, открытая {openPnl}; лимит {limit}). Новые входы остановлены до следующего дня.");
 
             if (_entrySent && GetActivePosition() != 0)
-                ClosePositionForAccountProfitTarget();
+                ClosePositionForAccountLimit();
 
             return false;
         }
 
-        private void ClosePositionForAccountProfitTarget()
+        private string GetAccountStopOutcome()
+        {
+            if (_accountStopReason == AccountStopReason.Profit)
+                return "account_profit_target";
+
+            if (_accountStopReason == AccountStopReason.Loss)
+                return "account_loss_limit";
+
+            return "account_limit_invalid";
+        }
+
+        private void ClosePositionForAccountLimit()
         {
             if (GetActivePosition() == 0)
             {
-                if (_accountProfitClosing)
+                if (_accountStopClosing)
                 {
-                    RecordTradeClosed("account_profit_target");
+                    RecordTradeClosed(GetAccountStopOutcome());
                     ResetTradeState();
                 }
 
                 return;
             }
 
-            if (!_accountProfitClosing)
+            if (!_accountStopClosing)
             {
-                _accountProfitClosing = true;
+                _accountStopClosing = true;
                 _closingTrade = true;
                 CancelProtectiveOrders();
             }
 
             if (GetActivePosition() == 0)
             {
-                RecordTradeClosed("account_profit_target");
+                RecordTradeClosed(GetAccountStopOutcome());
                 ResetTradeState();
                 return;
             }
 
             var currentBar = CurrentBar - 1;
-            if (_emergencyClosing || _lastProfitCloseAttemptBar == currentBar)
+            if (_emergencyClosing || _lastAccountCloseAttemptBar == currentBar)
                 return;
 
-            _lastProfitCloseAttemptBar = currentBar;
-            EmergencyFlattenPosition("account_profit_target");
+            _lastAccountCloseAttemptBar = currentBar;
+            EmergencyFlattenPosition(GetAccountStopOutcome());
         }
 
         private bool IsTradingTimeAllowed(int bar)
