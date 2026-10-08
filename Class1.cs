@@ -146,7 +146,7 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Range size", Order = 200)]
         public int RangeSize { get; set; } = 5;
 
-        [Display(GroupName = "07. Signal", Name = "MACD filter mode", Description = "Difference: long when MACD is above signal, short when below. Line cross: long only when MACD crosses above signal on the closed signal bar, short only when it crosses below. Both modes also require the existing body-engulfing pattern.", Order = 205)]
+        [Display(GroupName = "07. Signal", Name = "MACD filter mode", Description = "Difference: long when MACD is above signal, short when below. Line cross: the last MACD/signal crossing sets the allowed direction until the next opposite crossing; the body-engulfing pattern may occur on a later closed bar.", Order = 205)]
         public MacdFilterMode MacdMode { get; set; } = MacdFilterMode.Difference;
 
         [Display(GroupName = "08. TP/SL", Name = "TP/SL mode", Order = 250)]
@@ -220,6 +220,7 @@ namespace CashReaper
         private decimal[] _macd = Array.Empty<decimal>();
         private decimal[] _signal = Array.Empty<decimal>();
         private decimal[] _difference = Array.Empty<decimal>();
+        private int[] _macdCrossDirection = Array.Empty<int>();
 
         private readonly string _instanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
 
@@ -353,6 +354,7 @@ namespace CashReaper
                 _macd[bar] = 0;
                 _signal[bar] = 0;
                 _difference[bar] = 0;
+                _macdCrossDirection[bar] = 0;
                 return;
             }
 
@@ -361,6 +363,11 @@ namespace CashReaper
             _macd[bar] = _fastEma[bar] - _slowEma[bar];
             _signal[bar] = CalcEma(_macd[bar], _signal[bar - 1], SignalPeriod);
             _difference[bar] = _macd[bar] - _signal[bar];
+            _macdCrossDirection[bar] = _macdCrossDirection[bar - 1];
+            if (_difference[bar - 1] <= 0 && _difference[bar] > 0)
+                _macdCrossDirection[bar] = 1;
+            else if (_difference[bar - 1] >= 0 && _difference[bar] < 0)
+                _macdCrossDirection[bar] = -1;
 
             if (bar < 2)
                 return;
@@ -709,7 +716,7 @@ namespace CashReaper
 
             RaiseShowNotification(message);
             RecordSignal(bar, signalName, signalCandle.Close, diff, _activeVolume,
-                $"signal; macd_filter={MacdMode}; previous_difference={_difference[bar - 1]}");
+                $"signal; macd_filter={MacdMode}; last_cross_direction={_macdCrossDirection[bar]}; previous_difference={_difference[bar - 1]}");
 
             if (!TradingEnabled)
             {
@@ -1433,12 +1440,12 @@ namespace CashReaper
 
             if (currentBullish && previousBearish && !IsLongMacdSignal(bar))
                 return MacdMode == MacdFilterMode.LineCross
-                    ? $"long_macd_cross_filter; previous_difference={_difference[bar - 1]}; difference={diff}"
+                    ? $"long_macd_direction_filter; last_cross_direction={_macdCrossDirection[bar]}; difference={diff}"
                     : "long_macd_filter";
 
             if (currentBearish && previousBullish && !IsShortMacdSignal(bar))
                 return MacdMode == MacdFilterMode.LineCross
-                    ? $"short_macd_cross_filter; previous_difference={_difference[bar - 1]}; difference={diff}"
+                    ? $"short_macd_direction_filter; last_cross_direction={_macdCrossDirection[bar]}; difference={diff}"
                     : "short_macd_filter";
 
             if (!currentBullish && !currentBearish)
@@ -1453,14 +1460,14 @@ namespace CashReaper
         private bool IsLongMacdSignal(int bar)
         {
             return MacdMode == MacdFilterMode.LineCross
-                ? bar > 0 && _difference[bar - 1] <= 0 && _difference[bar] > 0
+                ? _macdCrossDirection[bar] > 0
                 : _difference[bar] > 0;
         }
 
         private bool IsShortMacdSignal(int bar)
         {
             return MacdMode == MacdFilterMode.LineCross
-                ? bar > 0 && _difference[bar - 1] >= 0 && _difference[bar] < 0
+                ? _macdCrossDirection[bar] < 0
                 : _difference[bar] < 0;
         }
 
@@ -2048,6 +2055,7 @@ namespace CashReaper
             Array.Resize(ref _macd, size);
             Array.Resize(ref _signal, size);
             Array.Resize(ref _difference, size);
+            Array.Resize(ref _macdCrossDirection, size);
         }
 
         private decimal CalcEma(decimal value, decimal previousEma, int period)
