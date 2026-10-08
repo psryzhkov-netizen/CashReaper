@@ -2,6 +2,7 @@ using System;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.IO;
+using System.Threading;
 using ATAS.DataFeedsCore;
 using ATAS.Strategies.Chart;
 
@@ -185,6 +186,8 @@ namespace CashReaper
         private decimal[] _difference = Array.Empty<decimal>();
 
         private readonly string _instanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
+        private static readonly object StatisticsFileLock = new object();
+        private string _statisticsFallbackPath;
 
         private int _lastProcessedSignalBar = -1;
         private int _entrySentBar = -1;
@@ -1529,15 +1532,7 @@ namespace CashReaper
         {
             try
             {
-                var path = GetStatisticsPath();
-                var fileExists = File.Exists(path);
-
-                using (var writer = new StreamWriter(path, append: true))
-                {
-                    if (!fileExists)
-                        writer.WriteLine(GetStatisticsHeader());
-
-                    writer.WriteLine(string.Join(",",
+                var row = string.Join(",",
                         Csv(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)),
                         Csv(GetInstanceLabel()),
                         Csv(Security == null ? "" : Security.ToString()),
@@ -1578,12 +1573,63 @@ namespace CashReaper
                         Csv(""),
                         Csv(""),
                         Csv(""),
-                        Csv("")));
+                        Csv(""));
+
+                string fallbackNotice = null;
+                lock (StatisticsFileLock)
+                {
+                    var path = _statisticsFallbackPath ?? GetStatisticsPath();
+                    try
+                    {
+                        AppendStatisticsRow(path, row);
+                    }
+                    catch (IOException) when (_statisticsFallbackPath == null)
+                    {
+                        // Another process may hold an exclusive lock on the shared CSV.
+                        // Preserve this and subsequent rows in an instance-specific file.
+                        _statisticsFallbackPath = Path.Combine(
+                            Path.GetDirectoryName(path),
+                            Path.GetFileNameWithoutExtension(path) + "-" + _instanceId + Path.GetExtension(path));
+                        AppendStatisticsRow(_statisticsFallbackPath, row);
+                        fallbackNotice = $"Shared statistics file is busy; writing to {Path.GetFileName(_statisticsFallbackPath)}";
+                    }
                 }
+
+                if (fallbackNotice != null)
+                    RaiseDebug(fallbackNotice);
             }
             catch (Exception ex)
             {
                 RaiseDebug($"Statistics Collector error: {ex.Message}");
+            }
+        }
+
+        private void AppendStatisticsRow(string path, string row)
+        {
+            const int attempts = 4;
+            for (var attempt = 0; attempt < attempts; attempt++)
+            {
+                try
+                {
+                    // The lock serializes CashReaper instances in this process; sharing
+                    // also lets other applications read the CSV while trading continues.
+                    using (var stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
+                    {
+                        var isEmpty = stream.Length == 0;
+                        stream.Seek(0, SeekOrigin.End);
+                        using (var writer = new StreamWriter(stream))
+                        {
+                            if (isEmpty)
+                                writer.WriteLine(GetStatisticsHeader());
+                            writer.WriteLine(row);
+                        }
+                    }
+                    return;
+                }
+                catch (IOException) when (attempt < attempts - 1)
+                {
+                    Thread.Sleep(25);
+                }
             }
         }
 
