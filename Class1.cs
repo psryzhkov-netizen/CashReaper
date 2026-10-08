@@ -37,6 +37,12 @@ namespace CashReaper
             Martingale = 2
         }
 
+        public enum ProfitTargetUnit
+        {
+            AccountCurrency = 0,
+            Points = 1
+        }
+
         [Display(GroupName = "01. Trading", Name = "Enable trading", Order = 10)]
         public bool TradingEnabled { get; set; } = true;
 
@@ -70,11 +76,17 @@ namespace CashReaper
         [Display(GroupName = "05. Risk sizing", Name = "Calculate volume from risk", Description = "If enabled, volume = reference balance x risk percentage / (stop distance x point value). If disabled, Base volume is used.", Order = 120)]
         public bool RiskSizingEnabled { get; set; } = false;
 
-        [Display(GroupName = "05. Risk sizing", Name = "Stop at daily account profit", Description = "Use the selected account's closed plus open PnL. On reaching the target, close this strategy's position, cancel its TP/SL and block new entries until the next chart day.", Order = 121)]
+        [Display(GroupName = "05. Risk sizing", Name = "Stop at daily profit", Description = "Choose account currency or this strategy's points. On reaching the target, close this strategy's position, cancel its TP/SL and block new entries until the next chart day.", Order = 121)]
         public bool AccountProfitTargetEnabled { get; set; } = false;
 
-        [Display(GroupName = "05. Risk sizing", Name = "Daily account profit target (account currency)", Description = "Positive amount in the account currency. Compared with ClosedPnL + OpenPnL of the whole selected account as reported by ATAS.", Order = 122)]
+        [Display(GroupName = "05. Risk sizing", Name = "Daily profit unit", Description = "Account currency uses ATAS ClosedPnL + OpenPnL for the selected account. Points uses this strategy's closed plus open price movement, without volume or commissions.", Order = 122)]
+        public ProfitTargetUnit DailyProfitUnit { get; set; } = ProfitTargetUnit.AccountCurrency;
+
+        [Display(GroupName = "05. Risk sizing", Name = "Daily account profit target (account currency)", Description = "Used only when Daily profit unit is AccountCurrency. Positive amount in account currency, compared with ClosedPnL + OpenPnL of the selected account.", Order = 1221)]
         public decimal AccountProfitTarget { get; set; } = 2m;
+
+        [Display(GroupName = "05. Risk sizing", Name = "Daily profit target (points)", Description = "Used only when Daily profit unit is Points. Sum of this strategy's closed trade price movements today plus its open position's price movement; independent of volume and commissions.", Order = 1222)]
+        public decimal DailyProfitTargetPoints { get; set; } = 0m;
 
         [Display(GroupName = "05. Risk sizing", Name = "Stop at daily account loss", Description = "Use the selected account's closed plus open PnL. On reaching the loss limit, close this strategy's position, cancel its TP/SL and block new entries until the next chart day.", Order = 123)]
         public bool AccountLossLimitEnabled { get; set; } = false;
@@ -191,6 +203,9 @@ namespace CashReaper
         private int _lastProtectiveRetryBar = -1;
         private DateTime _lastTimeLimitNoticeDate = DateTime.MinValue;
         private DateTime _accountStopBlockedDate = DateTime.MinValue;
+        private DateTime _dailyPointDate = DateTime.MinValue;
+        private decimal _dailyClosedPnlPoints;
+        private decimal _dailyOpenBasePrice;
         private int _entriesBlockedUntilBar = -1;
         private int _cancelRetryUntilBar = -1;
         private int _lastCancelRetryBar = -1;
@@ -263,8 +278,8 @@ namespace CashReaper
 
             RaiseShowNotification(
                 TradingEnabled
-                    ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; AccountProfitTarget={AccountProfitTargetEnabled}/{AccountProfitTarget}; AccountLossLimit={AccountLossLimitEnabled}/{AccountLossLimit}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}"
-                    : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; AccountProfitTarget={AccountProfitTargetEnabled}/{AccountProfitTarget}; AccountLossLimit={AccountLossLimitEnabled}/{AccountLossLimit}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}");
+                    ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; ProfitTarget={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget)}; AccountLossLimit={AccountLossLimitEnabled}/{AccountLossLimit}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}"
+                    : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; ProfitTarget={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget)}; AccountLossLimit={AccountLossLimitEnabled}/{AccountLossLimit}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}");
 
             RecordTradeEvent(
                 "strategy_started",
@@ -397,12 +412,15 @@ namespace CashReaper
                 return;
 
             var previousPosition = GetActivePosition();
+            var tradeBar = Math.Max(0, CurrentBar - 1);
+            UpdateDailyPointSession(GetTerminalTime(tradeBar).Date, GetCandle(tradeBar).Close, previousPosition);
             ApplyMyTradeToTrackedPosition(myTrade);
             var activePosition = GetActivePosition();
 
             if (previousPosition == 0 && activePosition != 0)
             {
                 _entryExecutionPrice = myTrade.Price;
+                _dailyOpenBasePrice = myTrade.Price;
                 _lastTradePnlPoints = 0;
             }
 
@@ -410,6 +428,8 @@ namespace CashReaper
             {
                 _lastTradePnlPoints = CalculateClosedTradePnlPoints(previousPosition, _entryExecutionPrice, myTrade.Price);
                 _totalPnlPoints += _lastTradePnlPoints;
+                _dailyClosedPnlPoints += CalculateClosedTradePnlPoints(previousPosition, _dailyOpenBasePrice, myTrade.Price);
+                _dailyOpenBasePrice = 0m;
             }
 
             var positionReversed = IsPositionReversed(previousPosition, activePosition);
@@ -418,6 +438,8 @@ namespace CashReaper
             {
                 _lastTradePnlPoints = CalculateClosedTradePnlPoints(previousPosition, _entryExecutionPrice, myTrade.Price);
                 _totalPnlPoints += _lastTradePnlPoints;
+                _dailyClosedPnlPoints += CalculateClosedTradePnlPoints(previousPosition, _dailyOpenBasePrice, myTrade.Price);
+                _dailyOpenBasePrice = myTrade.Price;
             }
 
             RecordTradeEvent(
@@ -1639,6 +1661,8 @@ namespace CashReaper
             }
 
             var chartDate = GetTerminalTime(CurrentBar - 1).Date;
+            var marketPrice = GetCandle(CurrentBar - 1).Close;
+            UpdateDailyPointSession(chartDate, marketPrice, GetActivePosition());
             if (_accountStopBlockedDate == chartDate)
                 return false;
 
@@ -1648,26 +1672,34 @@ namespace CashReaper
                 _accountStopReason = AccountStopReason.None;
             }
 
-            if (Portfolio == null ||
-                (AccountProfitTargetEnabled && AccountProfitTarget <= 0) ||
+            var profitInPoints = AccountProfitTargetEnabled && DailyProfitUnit == ProfitTargetUnit.Points;
+            var needsAccountPnl = AccountLossLimitEnabled || (AccountProfitTargetEnabled && !profitInPoints);
+
+            if ((needsAccountPnl && Portfolio == null) ||
+                (AccountProfitTargetEnabled && (profitInPoints ? DailyProfitTargetPoints : AccountProfitTarget) <= 0) ||
                 (AccountLossLimitEnabled && AccountLossLimit <= 0))
             {
                 if (!_accountLimitInvalidNotified)
                 {
                     _accountLimitInvalidNotified = true;
-                    RaiseShowNotification($"{GetInstanceLabel()}: денежный лимит счёта включён, но счёт не выбран или сумма включённого лимита не больше нуля. Новые входы заблокированы.");
+                    RaiseShowNotification($"{GetInstanceLabel()}: дневной лимит включён, но счёт для денежного режима не выбран или значение включённого лимита не больше нуля. Новые входы заблокированы.");
                 }
 
                 return false;
             }
 
             _accountLimitInvalidNotified = false;
-            var closedPnl = Portfolio.ClosedPnL;
-            var openPnl = Portfolio.OpenPnL;
+            var closedPnl = Portfolio == null ? 0m : Portfolio.ClosedPnL;
+            var openPnl = Portfolio == null ? 0m : Portfolio.OpenPnL;
             var accountPnl = closedPnl + openPnl;
+            var openPoints = GetActivePosition() == 0 ? 0m :
+                CalculateClosedTradePnlPoints(GetActivePosition(), _dailyOpenBasePrice, marketPrice);
+            var dailyPoints = _dailyClosedPnlPoints + openPoints;
             var reason = AccountStopReason.None;
 
-            if (AccountProfitTargetEnabled && accountPnl >= AccountProfitTarget)
+            if (AccountProfitTargetEnabled && (profitInPoints
+                    ? dailyPoints >= DailyProfitTargetPoints
+                    : accountPnl >= AccountProfitTarget))
                 reason = AccountStopReason.Profit;
             else if (AccountLossLimitEnabled && accountPnl <= -AccountLossLimit)
                 reason = AccountStopReason.Loss;
@@ -1678,16 +1710,34 @@ namespace CashReaper
             _accountStopBlockedDate = chartDate;
             _accountStopReason = reason;
 
-            var limit = reason == AccountStopReason.Profit ? AccountProfitTarget : AccountLossLimit;
+            var limit = reason == AccountStopReason.Profit
+                ? (profitInPoints ? DailyProfitTargetPoints : AccountProfitTarget)
+                : AccountLossLimit;
+            var resultText = reason == AccountStopReason.Profit && profitInPoints
+                ? $"daily_points={dailyPoints}; closed_points={_dailyClosedPnlPoints}; open_points={openPoints}; limit={limit}; unit=points"
+                : $"closed_pnl={closedPnl}; open_pnl={openPnl}; account_pnl={accountPnl}; limit={limit}; currency={Portfolio.Currency}";
             RecordTradeEvent(reason == AccountStopReason.Profit ? "account_profit_target_reached" : "account_loss_limit_reached",
-                bar, "", false,
-                $"closed_pnl={closedPnl}; open_pnl={openPnl}; account_pnl={accountPnl}; limit={limit}; currency={Portfolio.Currency}", 0m);
-            RaiseShowNotification($"{GetInstanceLabel()}: дневной лимит {(reason == AccountStopReason.Profit ? "прибыли" : "убытка")} счёта достигнут: {accountPnl} {Portfolio.Currency} (закрытая {closedPnl}, открытая {openPnl}; лимит {limit}). Новые входы остановлены до следующего дня.");
+                bar, "", false, resultText, 0m);
+            var notification = reason == AccountStopReason.Profit && profitInPoints
+                ? $"{GetInstanceLabel()}: дневной лимит прибыли достигнут: {dailyPoints} пунктов (закрытая {_dailyClosedPnlPoints}, открытая {openPoints}; лимит {limit}). Новые входы остановлены до следующего дня."
+                : $"{GetInstanceLabel()}: дневной лимит {(reason == AccountStopReason.Profit ? "прибыли" : "убытка")} счёта достигнут: {accountPnl} {Portfolio.Currency} (закрытая {closedPnl}, открытая {openPnl}; лимит {limit}). Новые входы остановлены до следующего дня.";
+            RaiseShowNotification(notification);
 
             if (_entrySent && GetActivePosition() != 0)
                 ClosePositionForAccountLimit();
 
             return false;
+        }
+
+        private void UpdateDailyPointSession(DateTime chartDate, decimal marketPrice, decimal position)
+        {
+            if (_dailyPointDate == chartDate)
+                return;
+
+            _dailyPointDate = chartDate;
+            _dailyClosedPnlPoints = 0m;
+            // A position carried over midnight contributes only the move observed today.
+            _dailyOpenBasePrice = position == 0 ? 0m : marketPrice;
         }
 
         private string GetAccountStopOutcome()
