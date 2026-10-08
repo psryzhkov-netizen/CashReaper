@@ -38,16 +38,16 @@ namespace CashReaper
         }
 
         [Display(GroupName = "01. Trading", Name = "Enable trading", Order = 10)]
-        public bool TradingEnabled { get; set; } = false;
+        public bool TradingEnabled { get; set; } = true;
 
         [Display(GroupName = "02. Replay and diagnostics", Name = "Market Replay mode", Order = 20)]
         public bool MarketReplayMode { get; set; } = true;
 
         [Display(GroupName = "02. Replay and diagnostics", Name = "Collect CSV statistics", Order = 30)]
-        public bool StatisticsCollectorEnabled { get; set; } = false;
+        public bool StatisticsCollectorEnabled { get; set; } = true;
 
         [Display(GroupName = "02. Replay and diagnostics", Name = "Debug notifications", Order = 40)]
-        public bool DebugMode { get; set; } = false;
+        public bool DebugMode { get; set; } = true;
 
         [Display(GroupName = "03. Recovery", Name = "Auto recovery", Order = 50)]
         public bool AutoRecoveryEnabled { get; set; } = true;
@@ -59,13 +59,13 @@ namespace CashReaper
         public bool RestoreProtectiveOrdersOnStart { get; set; } = true;
 
         [Display(GroupName = "04. Time filter", Name = "Use trading pause", Order = 80)]
-        public bool TradingTimeLimitEnabled { get; set; } = false;
+        public bool TradingTimeLimitEnabled { get; set; } = true;
 
         [Display(GroupName = "04. Time filter", Name = "Trade on Saturday", Description = "Allow new entries on Saturday in chart time. Existing positions remain protected.", Order = 81)]
-        public bool TradeOnSaturday { get; set; } = true;
+        public bool TradeOnSaturday { get; set; } = false;
 
         [Display(GroupName = "04. Time filter", Name = "Trade on Sunday", Description = "Allow new entries on Sunday in chart time. Existing positions remain protected.", Order = 82)]
-        public bool TradeOnSunday { get; set; } = true;
+        public bool TradeOnSunday { get; set; } = false;
 
         [Display(GroupName = "05. Risk sizing", Name = "Calculate volume from risk", Description = "If enabled, volume = reference balance x risk percentage / (stop distance x point value). If disabled, Base volume is used.", Order = 120)]
         public bool RiskSizingEnabled { get; set; } = false;
@@ -74,7 +74,7 @@ namespace CashReaper
         public bool AccountProfitTargetEnabled { get; set; } = false;
 
         [Display(GroupName = "05. Risk sizing", Name = "Daily account profit target (account currency)", Description = "Positive amount in the account currency. Compared with ClosedPnL + OpenPnL of the whole selected account as reported by ATAS.", Order = 122)]
-        public decimal AccountProfitTarget { get; set; } = 0m;
+        public decimal AccountProfitTarget { get; set; } = 2m;
 
         [Display(GroupName = "05. Risk sizing", Name = "Stop at daily account loss", Description = "Use the selected account's closed plus open PnL. On reaching the loss limit, close this strategy's position, cancel its TP/SL and block new entries until the next chart day.", Order = 123)]
         public bool AccountLossLimitEnabled { get; set; } = false;
@@ -83,7 +83,7 @@ namespace CashReaper
         public decimal AccountLossLimit { get; set; } = 0m;
 
         [Display(GroupName = "06. Series sizing", Name = "Use series sizing", Order = 150)]
-        public bool SeriesSizingEnabled { get; set; } = false;
+        public bool SeriesSizingEnabled { get; set; } = true;
 
         [Display(GroupName = "03. Recovery", Name = "Entry timeout bars", Order = 90)]
         public int EntryRecoveryBars { get; set; } = 3;
@@ -104,7 +104,7 @@ namespace CashReaper
         public int TradingPauseStartMinute { get; set; } = 59;
 
         [Display(GroupName = "04. Time filter", Name = "Pause end hour", Order = 112)]
-        public int TradingPauseEndHour { get; set; } = 2;
+        public int TradingPauseEndHour { get; set; } = 4;
 
         [Display(GroupName = "04. Time filter", Name = "Pause end minute", Order = 113)]
         public int TradingPauseEndMinute { get; set; } = 0;
@@ -116,10 +116,10 @@ namespace CashReaper
         public ProtectionMode ProtectionCalculationMode { get; set; } = ProtectionMode.Points;
 
         [Display(GroupName = "06. Series sizing", Name = "Series mode", Order = 160)]
-        public SeriesMode SeriesSizingMode { get; set; } = SeriesMode.Linear;
+        public SeriesMode SeriesSizingMode { get; set; } = SeriesMode.Martingale;
 
         [Display(GroupName = "06. Series sizing", Name = "Max series step", Order = 170)]
-        public int MaxSeriesStep { get; set; } = 4;
+        public int MaxSeriesStep { get; set; } = 15;
 
         [Display(GroupName = "07. Signal", Name = "MACD fast period", Order = 210)]
         public int FastPeriod { get; set; } = 12;
@@ -131,22 +131,22 @@ namespace CashReaper
         public int SignalPeriod { get; set; } = 9;
 
         [Display(GroupName = "01. Trading", Name = "Base volume", Order = 11)]
-        public decimal Volume { get; set; } = 0.001m;
+        public decimal Volume { get; set; } = 0.1m;
 
         [Display(GroupName = "01. Trading", Name = "Min volume", Order = 12)]
-        public decimal MinVolume { get; set; } = 0.001m;
+        public decimal MinVolume { get; set; } = 0.1m;
 
         [Display(GroupName = "01. Trading", Name = "Max volume (0 = off)", Order = 13)]
         public decimal MaxVolume { get; set; } = 0m;
 
         [Display(GroupName = "01. Trading", Name = "Volume step", Order = 14)]
-        public decimal VolumeStep { get; set; } = 0.001m;
+        public decimal VolumeStep { get; set; } = 0.1m;
 
         [Display(GroupName = "08. TP/SL", Name = "Take profit points", Order = 260)]
-        public decimal TakeProfitPoints { get; set; } = 400m;
+        public decimal TakeProfitPoints { get; set; } = 0.31m;
 
         [Display(GroupName = "08. TP/SL", Name = "Stop loss points", Order = 270)]
-        public decimal StopLossPoints { get; set; } = 200m;
+        public decimal StopLossPoints { get; set; } = 0.25m;
 
         [Display(GroupName = "08. TP/SL", Name = "Take profit price %", Order = 280)]
         public decimal TakeProfitPricePercent { get; set; } = 0.5m;
