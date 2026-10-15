@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.IO;
@@ -58,6 +59,9 @@ namespace CashReaper
 
         [Display(GroupName = "02. Replay and diagnostics", Name = "Collect CSV statistics", Order = 30)]
         public bool StatisticsCollectorEnabled { get; set; } = true;
+
+        [Display(GroupName = "02. Replay and diagnostics", Name = "Collect signal footprints", Description = "Record Bid/Ask at every price level of an engulfing signal bar for offline imbalance analysis. Does not affect orders.", Order = 31)]
+        public bool FootprintCollectorEnabled { get; set; } = true;
 
         [Display(GroupName = "02. Replay and diagnostics", Name = "Debug notifications", Order = 40)]
         public bool DebugMode { get; set; } = true;
@@ -262,6 +266,7 @@ namespace CashReaper
         private bool _accountStopClosing;
         private AccountStopReason _accountStopReason;
         private bool _emergencyClosing;
+        private string _activeSignalKey = "";
 
         private decimal _takeProfitPrice;
         private decimal _stopLossPrice;
@@ -749,6 +754,7 @@ namespace CashReaper
             if (!ValidateTradingContext())
                 return;
 
+            _activeSignalKey = GetSignalKey(bar);
             SendEntryOrder(direction);
         }
 
@@ -1522,6 +1528,7 @@ namespace CashReaper
             _takeProfitPrice = 0;
             _stopLossPrice = 0;
             _entryExecutionPrice = 0;
+            _activeSignalKey = "";
         }
 
         private void RaiseDebug(string message)
@@ -1597,6 +1604,9 @@ namespace CashReaper
                 diff,
                 engulf,
                 0m);
+
+            if (engulf && FootprintCollectorEnabled)
+                WriteFootprintSnapshot(bar);
         }
 
         private void RecordSignal(int bar, string signalName, decimal close, decimal diff, decimal volume, string reason)
@@ -1688,6 +1698,89 @@ namespace CashReaper
                 order.QuantityToFill);
         }
 
+        private string GetSignalKey(int bar)
+        {
+            if (bar < 0 || bar >= CurrentBar)
+                return "";
+
+            return _instanceId + ":" + bar.ToString(CultureInfo.InvariantCulture) + ":" +
+                   GetCandle(bar).LastTime.Ticks.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private (string Status, decimal? BuyMaxPercent, decimal? SellMaxPercent, int LevelCount) GetImbalanceStats(int bar)
+        {
+            if (bar < 0 || bar >= CurrentBar || TickSize <= 0)
+                return ("unavailable", null, null, 0);
+
+            var levels = new Dictionary<decimal, (decimal Bid, decimal Ask)>();
+            foreach (var level in GetCandle(bar).GetAllPriceLevels())
+            {
+                if (level != null)
+                    levels[level.Price] = (level.Bid, level.Ask);
+            }
+
+            if (levels.Count == 0)
+                return ("no_footprint_data", null, null, 0);
+
+            decimal? buyMax = null;
+            decimal? sellMax = null;
+            foreach (var pair in levels)
+            {
+                // ATAS footprint imbalance compares Ask at the upper price with Bid one tick below.
+                if (pair.Value.Ask > 0 && levels.TryGetValue(pair.Key - TickSize, out var lower) && lower.Bid > 0)
+                {
+                    var ratio = 100m * pair.Value.Ask / lower.Bid;
+                    if (!buyMax.HasValue || ratio > buyMax.Value)
+                        buyMax = ratio;
+                }
+
+                if (pair.Value.Bid > 0 && levels.TryGetValue(pair.Key + TickSize, out var upper) && upper.Ask > 0)
+                {
+                    var ratio = 100m * pair.Value.Bid / upper.Ask;
+                    if (!sellMax.HasValue || ratio > sellMax.Value)
+                        sellMax = ratio;
+                }
+            }
+
+            return (buyMax.HasValue || sellMax.HasValue ? "ok" : "no_comparable_levels",
+                    buyMax, sellMax, levels.Count);
+        }
+
+        private void WriteFootprintSnapshot(int bar)
+        {
+            try
+            {
+                var signalKey = GetSignalKey(bar);
+                var candle = GetCandle(bar);
+                var path = Path.Combine(Path.GetDirectoryName(GetStatisticsPath()), "CashReaperFootprint-imbalance-v1.csv");
+                lock (StatsFileLock)
+                {
+                    var fileExists = File.Exists(path);
+                    using (var writer = new StreamWriter(path, append: true))
+                    {
+                        if (!fileExists)
+                            writer.WriteLine("signal_key,instance,instrument,bar,bar_last_time,price,bid,ask,tick_size");
+
+                        foreach (var level in candle.GetAllPriceLevels())
+                        {
+                            if (level == null)
+                                continue;
+
+                            writer.WriteLine(string.Join(",",
+                                Csv(signalKey), Csv(GetInstanceLabel()),
+                                Csv(Security == null ? "" : Security.ToString()), Csv(bar),
+                                Csv(candle.LastTime.ToString("O", CultureInfo.InvariantCulture)),
+                                Csv(level.Price), Csv(level.Bid), Csv(level.Ask), Csv(TickSize)));
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                RaiseDebug($"Footprint Collector error: {ex.Message}");
+            }
+        }
+
         private void WriteStatsLine(
             string eventType,
             int bar,
@@ -1707,6 +1800,35 @@ namespace CashReaper
         {
             try
             {
+                var isSignalBar = bar >= 0 && bar < CurrentBar &&
+                    (eventType == "signal" || (eventType == "bar" && engulf));
+                var imbalanceStatus = "not_signal_bar";
+                decimal? buyMaxPercent = null;
+                decimal? sellMaxPercent = null;
+                var footprintLevelCount = 0;
+                if (isSignalBar)
+                {
+                    try
+                    {
+                        var stats = GetImbalanceStats(bar);
+                        imbalanceStatus = stats.Status;
+                        buyMaxPercent = stats.BuyMaxPercent;
+                        sellMaxPercent = stats.SellMaxPercent;
+                        footprintLevelCount = stats.LevelCount;
+                    }
+                    catch (Exception ex)
+                    {
+                        imbalanceStatus = "read_error:" + ex.GetType().Name;
+                    }
+                }
+
+                var signalKey = isSignalBar ? GetSignalKey(bar) : _activeSignalKey;
+                var signalDirection = signalName;
+                if (signalDirection == "" && eventType == "bar" && engulf)
+                    signalDirection = close > open ? "LONG" : close < open ? "SHORT" : "";
+                decimal? directionalImbalance = signalDirection == "LONG" ? buyMaxPercent :
+                    signalDirection == "SHORT" ? sellMaxPercent : null;
+
                 var path = GetStatisticsPath();
                 lock (StatsFileLock)
                 {
@@ -1757,7 +1879,7 @@ namespace CashReaper
                         Csv(""),
                         Csv(""),
                         Csv(""),
-                        Csv(""),
+                        Csv(directionalImbalance.HasValue ? directionalImbalance.Value.ToString(CultureInfo.InvariantCulture) : ""),
                         Csv(CurrentBar > 0 ? GetTerminalTime(CurrentBar - 1).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : ""),
                         Csv(Portfolio == null ? "" : Portfolio.Currency.ToString()),
                         Csv(Portfolio == null ? 0m : Portfolio.ClosedPnL),
@@ -1779,7 +1901,12 @@ namespace CashReaper
                         Csv(_accountStopBlockedDate == DateTime.MinValue ? "" : _accountStopBlockedDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)),
                         Csv(_entryOrder == null ? "" : _entryOrder.Id),
                         Csv(_entryOrder == null ? "" : _entryOrder.State.ToString()),
-                        Csv(_moneyEstimatePosition)));
+                        Csv(_moneyEstimatePosition),
+                        Csv(signalKey),
+                        Csv(imbalanceStatus),
+                        Csv(buyMaxPercent.HasValue ? buyMaxPercent.Value.ToString(CultureInfo.InvariantCulture) : ""),
+                        Csv(sellMaxPercent.HasValue ? sellMaxPercent.Value.ToString(CultureInfo.InvariantCulture) : ""),
+                        Csv(footprintLevelCount)));
                     }
                 }
             }
@@ -1791,7 +1918,7 @@ namespace CashReaper
 
         private string GetStatisticsHeader()
         {
-            return "time,instance,instrument,event,bar,state,open,high,low,close,body,range,macd_difference,body_engulf,signal,direction,accepted,reason,volume,tp,sl,tp_points,sl_points,protection_mode,series_step,range_size,commission_per_contract,commission_percent,portfolio,connector,market_replay_mode,trading_enabled,current_position,entry_price,unrealized_pnl_points,last_trade_pnl_points,total_pnl_points,delta,delta_volume,cvd,imbalance,chart_time,account_currency,atas_closed_pnl,atas_open_pnl,daily_chart_date,atas_daily_equity_baseline,atas_daily_pnl,strategy_daily_closed_estimate,strategy_daily_commission_estimate,strategy_daily_net_estimate,point_value,money_pnl_source,profit_limit_enabled,profit_limit_unit,profit_limit_value,loss_limit_enabled,loss_limit_unit,loss_limit_value,blocked_chart_date,entry_order_id,entry_order_state,estimate_position";
+            return "time,instance,instrument,event,bar,state,open,high,low,close,body,range,macd_difference,body_engulf,signal,direction,accepted,reason,volume,tp,sl,tp_points,sl_points,protection_mode,series_step,range_size,commission_per_contract,commission_percent,portfolio,connector,market_replay_mode,trading_enabled,current_position,entry_price,unrealized_pnl_points,last_trade_pnl_points,total_pnl_points,delta,delta_volume,cvd,imbalance,chart_time,account_currency,atas_closed_pnl,atas_open_pnl,daily_chart_date,atas_daily_equity_baseline,atas_daily_pnl,strategy_daily_closed_estimate,strategy_daily_commission_estimate,strategy_daily_net_estimate,point_value,money_pnl_source,profit_limit_enabled,profit_limit_unit,profit_limit_value,loss_limit_enabled,loss_limit_unit,loss_limit_value,blocked_chart_date,entry_order_id,entry_order_state,estimate_position,signal_key,imbalance_status,imbalance_buy_max_pct,imbalance_sell_max_pct,footprint_level_count";
         }
 
         private string GetStatisticsPath()
@@ -1807,7 +1934,7 @@ namespace CashReaper
                 : StatisticsFileName;
 
             // The schema changed; never append new columns under an old CSV header.
-            var diagnosticName = Path.GetFileNameWithoutExtension(fileName) + "-money-diagnostics" +
+            var diagnosticName = Path.GetFileNameWithoutExtension(fileName) + "-imbalance-v1" +
                 (string.IsNullOrEmpty(Path.GetExtension(fileName)) ? ".csv" : Path.GetExtension(fileName));
             return Path.Combine(directory, diagnosticName);
         }
