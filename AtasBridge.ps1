@@ -49,7 +49,7 @@ if (-not (Test-Path -LiteralPath $secretPath)) {
 Add-Type -AssemblyName System.Net.Http
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $securePassword = (Get-Content -LiteralPath $secretPath -Raw).Trim() | ConvertTo-SecureString
-$credential = New-Object System.Management.Automation.PSCredential('dashboard', $securePassword)
+$credential = [System.Management.Automation.PSCredential]::new('dashboard', $securePassword)
 $password = $credential.GetNetworkCredential().Password
 
 $handler = [System.Net.Http.HttpClientHandler]::new()
@@ -59,9 +59,9 @@ $client = [System.Net.Http.HttpClient]::new($handler)
 $client.Timeout = [TimeSpan]::FromSeconds(90)
 
 try {
-    $login = [System.Net.Http.FormUrlEncodedContent]::new(@{
-        password = $password
-    })
+    $loginFields = [System.Collections.Generic.Dictionary[string,string]]::new()
+    $loginFields.Add('password', $password)
+    $login = [System.Net.Http.FormUrlEncodedContent]::new($loginFields)
     $loginResponse = $client.PostAsync($baseUrl + '/login', $login).GetAwaiter().GetResult()
     $loginResponse.EnsureSuccessStatusCode() | Out-Null
     $check = $client.GetAsync($baseUrl + '/api/data').GetAwaiter().GetResult()
