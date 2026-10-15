@@ -1942,6 +1942,8 @@ namespace CashReaper
         private string Csv(object value)
         {
             var text = Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
+            // One physical line per event lets the bridge upload complete append-only chunks.
+            text = text.Replace("\r", " ").Replace("\n", " ");
             text = text.Replace("\"", "\"\"");
             return $"\"{text}\"";
         }
