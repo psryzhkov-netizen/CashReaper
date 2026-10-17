@@ -1106,8 +1106,8 @@ namespace CashReaper
             _entryExecutionPrice = AveragePrice;
             if (_entryExecutionPrice <= 0)
             {
-                RaiseShowNotification($"{GetInstanceLabel()}: нельзя восстановить TP/SL: ATAS не вернул фактическую среднюю цену входа. Закрываю незащищённую позицию.");
-                EmergencyFlattenPosition("entry_price_unavailable_on_restore");
+                _entrySentBar = -1;
+                RaiseShowNotification($"{GetInstanceLabel()}: нельзя восстановить TP/SL: ATAS не вернул фактическую среднюю цену входа. Позиция остаётся открытой без новых защитных заявок; проверьте её вручную. Новые входы заблокированы.");
                 return;
             }
             _entryBasePrice = _entryExecutionPrice;
@@ -1133,6 +1133,16 @@ namespace CashReaper
             {
                 if (_entryExecutionPrice <= 0)
                 {
+                    if (_entrySentBar < 0 && AveragePrice > 0)
+                    {
+                        _entryExecutionPrice = AveragePrice;
+                        _entryBasePrice = _entryExecutionPrice;
+                        _bestFavorablePrice = _entryExecutionPrice;
+                        _activeVolume = Math.Abs(GetActivePosition());
+                        CalculateProtectionPrices(_entryExecutionPrice, _entryDirection, _activeVolume);
+                        PlaceProtectiveOrders();
+                        return;
+                    }
                     if (_entrySentBar >= 0 && signalBar - _entrySentBar >= Math.Max(EntryRecoveryBars, 1))
                         EmergencyFlattenPosition("entry_price_unavailable");
                     return;
