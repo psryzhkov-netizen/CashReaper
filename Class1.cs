@@ -51,6 +51,13 @@ namespace CashReaper
             StrategyTradesEstimate = 1
         }
 
+        public enum TrailingStopMode
+        {
+            Off = 0,
+            Price = 1,
+            ClosedBar = 2
+        }
+
         [Display(GroupName = "01. Trading", Name = "Enable trading", Order = 10)]
         public bool TradingEnabled { get; set; } = true;
 
@@ -147,6 +154,12 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Use MACD filter", Description = "MACD filters new entries only: long when difference > 0, short when difference < 0. An opposite body engulfing always closes the current position, even when MACD disagrees.", Order = 201)]
         public bool UseMacdFilter { get; set; } = true;
 
+        [Display(GroupName = "07. Signal", Name = "Use imbalance filter", Description = "Require directional diagonal footprint imbalance on the closed signal bar. If footprint data is unavailable, skip the entry.", Order = 202)]
+        public bool UseImbalanceFilter { get; set; } = false;
+
+        [Display(GroupName = "07. Signal", Name = "Minimum imbalance %", Description = "Long: maximum Ask/Bid imbalance; Short: maximum Bid/Ask imbalance on the signal bar.", Order = 203)]
+        public decimal MinimumImbalancePercent { get; set; } = 10000m;
+
         [Display(GroupName = "08. TP/SL", Name = "TP/SL mode", Order = 250)]
         public ProtectionMode ProtectionCalculationMode { get; set; } = ProtectionMode.Points;
 
@@ -185,6 +198,21 @@ namespace CashReaper
 
         [Display(GroupName = "08. TP/SL", Name = "Stop loss points", Order = 270)]
         public decimal StopLossPoints { get; set; } = 0.25m;
+
+        [Display(GroupName = "08. TP/SL", Name = "Move stop to breakeven", Order = 271)]
+        public bool BreakEvenEnabled { get; set; } = false;
+
+        [Display(GroupName = "08. TP/SL", Name = "Breakeven trigger points", Description = "Favorable price movement from the actual entry fill required before moving the stop.", Order = 272)]
+        public decimal BreakEvenTriggerPoints { get; set; } = 0.15m;
+
+        [Display(GroupName = "08. TP/SL", Name = "Breakeven offset points", Description = "Lock this many price points beyond the actual entry price; zero means exactly breakeven before fees.", Order = 273)]
+        public decimal BreakEvenOffsetPoints { get; set; } = 0m;
+
+        [Display(GroupName = "08. TP/SL", Name = "Trailing stop mode", Description = "Price: follow the most favorable observed price. Closed bar: move behind each completed bar's low/high. Only tightens the stop.", Order = 274)]
+        public TrailingStopMode TrailingMode { get; set; } = TrailingStopMode.Off;
+
+        [Display(GroupName = "08. TP/SL", Name = "Trailing distance points", Description = "Distance behind the best observed price in Price mode; buffer behind the previous bar low/high in Closed bar mode.", Order = 275)]
+        public decimal TrailingDistancePoints { get; set; } = 0.15m;
 
         [Display(GroupName = "08. TP/SL", Name = "Take profit price %", Order = 280)]
         public decimal TakeProfitPricePercent { get; set; } = 0.5m;
@@ -251,6 +279,7 @@ namespace CashReaper
         private Order _emergencyOrder;
         private Order _takeProfitOrder;
         private Order _stopLossOrder;
+        private Order _stopReplacementOrder;
         private Order _pendingCancelTakeProfitOrder;
         private Order _pendingCancelStopLossOrder;
 
@@ -273,7 +302,12 @@ namespace CashReaper
         private decimal _activeVolume;
         private decimal _entryBasePrice;
         private decimal _entryExecutionPrice;
+        private decimal _bestFavorablePrice;
+        private bool _stopModificationPending;
+        private decimal _requestedStopPrice;
+        private int _stopModificationRequestedBar = -1;
         private decimal _lastTradePnlPoints;
+        private bool _exitFillObserved;
         private decimal _totalPnlPoints;
         private decimal _lastKnownPosition;
         private decimal _trackedPosition;
@@ -328,7 +362,9 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
+                $"macd_filter={UseMacdFilter}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; " +
+                $"breakeven={BreakEvenEnabled}/{BreakEvenTriggerPoints}/{BreakEvenOffsetPoints}; trailing={TrailingMode}/{TrailingDistancePoints}; " +
+                $"reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
         }
 
         protected override void OnStopping()
@@ -385,6 +421,7 @@ namespace CashReaper
             CheckAccountLimits(bar);
 
             var signalBar = bar - 1;
+            UpdateDynamicStop(candle.Close, signalBar, signalBar > _lastProcessedSignalBar);
 
             if (signalBar <= _lastProcessedSignalBar)
                 return;
@@ -406,6 +443,20 @@ namespace CashReaper
 
             RecordOrderEvent(order, "order_changed", "atas_order_changed");
             UpdateProtectiveOrderState(order);
+
+            if (_stopModificationPending && !IsTerminalOrder(order) &&
+                order.TriggerPrice == _requestedStopPrice &&
+                (IsMatchingOrder(_stopLossOrder, order) || IsMatchingOrder(_stopReplacementOrder, order) ||
+                 (order.Type == OrderTypes.Stop && order.Direction == GetExitDirectionForCurrentPosition() &&
+                  order.QuantityToFill == Math.Abs(GetActivePosition()))))
+            {
+                _stopLossOrder = order;
+                _stopLossPrice = _requestedStopPrice;
+                _stopModificationPending = false;
+                _stopReplacementOrder = null;
+                RecordTradeEvent("stop_move_confirmed", _lastProcessedSignalBar,
+                    order.Direction.ToString(), true, $"stop={_stopLossPrice}", order.QuantityToFill);
+            }
 
             if (IsMatchingOrder(_emergencyOrder, order) && IsTerminalOrder(order) && GetActivePosition() != 0)
             {
@@ -437,7 +488,8 @@ namespace CashReaper
                 return;
             }
 
-            if (UseProtectiveOrders && GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent)
+            if (UseProtectiveOrders && GetActivePosition() != 0 && _entrySent &&
+                !_protectiveOrdersSent && _entryExecutionPrice > 0)
             {
                 RaiseDebug("Позиция есть, но защитные заявки ещё не активны. Проверяю защиту.");
                 PlaceProtectiveOrders();
@@ -461,16 +513,26 @@ namespace CashReaper
             ApplyMyTradeToTrackedPosition(myTrade);
             var activePosition = GetActivePosition();
 
-            if (previousPosition == 0 && activePosition != 0)
+            var entryFill = IsSameOrder(_entryOrder, myTrade);
+            if (entryFill && activePosition != 0 && _entryExecutionPrice <= 0)
             {
                 _entryExecutionPrice = myTrade.Price;
+                _bestFavorablePrice = _entryExecutionPrice;
                 _dailyOpenBasePrice = myTrade.Price;
                 _lastTradePnlPoints = 0;
+                _exitFillObserved = false;
+            }
+            else if (entryFill && previousPosition != 0 && activePosition != 0 && !IsPositionReversed(previousPosition, activePosition) &&
+                     Math.Abs(activePosition) > Math.Abs(previousPosition) && _entryExecutionPrice > 0)
+            {
+                _entryExecutionPrice = (_entryExecutionPrice * Math.Abs(previousPosition) + myTrade.Price * myTrade.Volume) /
+                    Math.Abs(activePosition);
             }
 
             if (previousPosition != 0 && activePosition == 0)
             {
                 _lastTradePnlPoints = CalculateClosedTradePnlPoints(previousPosition, _entryExecutionPrice, myTrade.Price);
+                _exitFillObserved = true;
                 _totalPnlPoints += _lastTradePnlPoints;
                 _dailyClosedPnlPoints += CalculateClosedTradePnlPoints(previousPosition, _dailyOpenBasePrice, myTrade.Price);
                 _dailyOpenBasePrice = 0m;
@@ -545,7 +607,7 @@ namespace CashReaper
                 return;
             }
 
-            if (previousPosition == 0 && activePosition != 0 && _entrySent && !_protectiveOrdersSent)
+            if (activePosition != 0 && _entrySent && !_protectiveOrdersSent && _entryExecutionPrice > 0)
             {
                 HandleEntryFilled();
                 return;
@@ -561,6 +623,14 @@ namespace CashReaper
                 return;
 
             RecordOrderEvent(order, "order_register_failed", message);
+
+            if (_stopModificationPending && IsMatchingOrder(_stopReplacementOrder, order))
+            {
+                _stopModificationPending = false;
+                _stopReplacementOrder = null;
+                RaiseShowNotification($"{GetInstanceLabel()}: перестановка стопа отклонена. Проверьте прежний стоп. {message}");
+                return;
+            }
 
             if (IsMatchingOrder(_emergencyOrder, order))
             {
@@ -696,15 +766,25 @@ namespace CashReaper
 
             if (isLong)
             {
+                if (!PassesImbalanceFilter(bar, OrderDirections.Buy))
+                {
+                    RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "imbalance_filter");
+                    return;
+                }
                 RecordBarDecision(bar, current, previous, diff, engulf, "LONG", true, "accepted");
-                ProcessSignal(OrderDirections.Buy, "LONG", bar, diff);
+                ProcessSignal(OrderDirections.Buy, "LONG", bar, diff, true);
                 return;
             }
 
             if (isShort)
             {
+                if (!PassesImbalanceFilter(bar, OrderDirections.Sell))
+                {
+                    RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", false, "imbalance_filter");
+                    return;
+                }
                 RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", true, "accepted");
-                ProcessSignal(OrderDirections.Sell, "SHORT", bar, diff);
+                ProcessSignal(OrderDirections.Sell, "SHORT", bar, diff, true);
                 return;
             }
 
@@ -716,18 +796,22 @@ namespace CashReaper
                 $"Сигнала нет. Bar={bar}; CurrentBull={currentBullish}; CurrentBear={currentBearish}; PreviousBull={previousBullish}; PreviousBear={previousBearish}; Engulf={engulf}; Diff={diff}");
         }
 
-        private void ProcessSignal(OrderDirections direction, string signalName, int bar, decimal diff)
+        private void ProcessSignal(OrderDirections direction, string signalName, int bar, decimal diff,
+            bool imbalanceChecked = false)
         {
+            if (!imbalanceChecked && !PassesImbalanceFilter(bar, direction))
+                return;
+
             var signalCandle = GetCandle(bar);
 
             _entryDirection = direction;
             _entryBasePrice = signalCandle.Close;
-            CalculateProtectionPrices(_entryBasePrice, direction, Volume);
-
-            var stopDistance = Math.Abs(_entryBasePrice - _stopLossPrice);
+            // The signal close is only a sizing estimate. Live TP/SL prices are set
+            // after the market entry has actually filled.
+            var stopDistance = CalculateStopLossDistance(_entryBasePrice, Volume);
             _activeVolume = CalculateOrderVolume(stopDistance);
-
-            CalculateProtectionPrices(_entryBasePrice, direction, _activeVolume);
+            _takeProfitPrice = 0m;
+            _stopLossPrice = 0m;
 
             var message =
                 $"{GetInstanceLabel()}: {signalName} signal. " +
@@ -735,8 +819,7 @@ namespace CashReaper
                 $"Close={signalCandle.Close}; " +
                 $"Difference={diff}; " +
                 $"Volume={_activeVolume}; " +
-                $"TP={(UseProtectiveOrders ? _takeProfitPrice.ToString() : "off")}; " +
-                $"SL={(UseProtectiveOrders ? _stopLossPrice.ToString() : "off")}; " +
+                $"TP/SL={(UseProtectiveOrders ? "from actual fill" : "off")}; " +
                 $"TPPoints={TakeProfitPoints}; " +
                 $"SLPoints={StopLossPoints}; " +
                 $"ProtectionMode={ProtectionCalculationMode}; " +
@@ -909,6 +992,12 @@ namespace CashReaper
 
             var activePosition = GetActivePosition();
 
+            if (_entryExecutionPrice <= 0)
+                return;
+
+            _bestFavorablePrice = _entryExecutionPrice;
+            CalculateProtectionPrices(_entryExecutionPrice, _entryDirection, Math.Abs(activePosition));
+
             _tradeState = TradeState.PositionOpen;
             _lastKnownPosition = activePosition;
             RecordTradeEvent("entry_filled", _lastProcessedSignalBar, _entryDirection.ToString(), true, "position_open", Math.Abs(activePosition));
@@ -925,6 +1014,8 @@ namespace CashReaper
         private void PlaceProtectiveOrders()
         {
             if (!UseProtectiveOrders)
+                return;
+            if (_entryExecutionPrice <= 0)
                 return;
             // OnOrderChanged can be called synchronously from OpenOrder. Never create
             // another pair while the first pair is being registered.
@@ -1008,20 +1099,27 @@ namespace CashReaper
         private void RestoreProtectionForExistingPosition()
         {
             var bar = Math.Max(0, CurrentBar - 2);
-            var candle = GetCandle(bar);
 
             _entrySent = true;
             _entrySentBar = bar;
             _activeVolume = Math.Abs(GetActivePosition());
-            _entryBasePrice = candle.Close;
+            _entryExecutionPrice = AveragePrice;
+            if (_entryExecutionPrice <= 0)
+            {
+                _entrySentBar = -1;
+                RaiseShowNotification($"{GetInstanceLabel()}: нельзя восстановить TP/SL: ATAS не вернул фактическую среднюю цену входа. Позиция остаётся открытой без новых защитных заявок; проверьте её вручную. Новые входы заблокированы.");
+                return;
+            }
+            _entryBasePrice = _entryExecutionPrice;
+            _bestFavorablePrice = _entryExecutionPrice;
             _entryDirection = GetActivePosition() > 0
                 ? OrderDirections.Buy
                 : OrderDirections.Sell;
 
-            CalculateProtectionPrices(candle.Close, _entryDirection, _activeVolume);
+            CalculateProtectionPrices(_entryExecutionPrice, _entryDirection, _activeVolume);
 
             RaiseShowNotification(
-                $"{GetInstanceLabel()}: восстановление сопровождения открытой позиции. BasePrice={candle.Close}; TP={_takeProfitPrice}; SL={_stopLossPrice}");
+                $"{GetInstanceLabel()}: восстановление сопровождения открытой позиции. EntryPrice={_entryExecutionPrice}; TP={_takeProfitPrice}; SL={_stopLossPrice}");
 
             PlaceProtectiveOrders();
         }
@@ -1033,6 +1131,22 @@ namespace CashReaper
 
             if (UseProtectiveOrders && GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent)
             {
+                if (_entryExecutionPrice <= 0)
+                {
+                    if (_entrySentBar < 0 && AveragePrice > 0)
+                    {
+                        _entryExecutionPrice = AveragePrice;
+                        _entryBasePrice = _entryExecutionPrice;
+                        _bestFavorablePrice = _entryExecutionPrice;
+                        _activeVolume = Math.Abs(GetActivePosition());
+                        CalculateProtectionPrices(_entryExecutionPrice, _entryDirection, _activeVolume);
+                        PlaceProtectiveOrders();
+                        return;
+                    }
+                    if (_entrySentBar >= 0 && signalBar - _entrySentBar >= Math.Max(EntryRecoveryBars, 1))
+                        EmergencyFlattenPosition("entry_price_unavailable");
+                    return;
+                }
                 if (_lastProtectiveRetryBar >= 0 &&
                     signalBar - _lastProtectiveRetryBar < ProtectiveRetryBars)
                     return;
@@ -1077,10 +1191,7 @@ namespace CashReaper
             CancelProtectiveOrders();
             _entriesBlockedUntilBar = Math.Max(_entriesBlockedUntilBar, _lastProcessedSignalBar + Math.Max(PostCloseCooldownBars, 1));
 
-            if (outcome == "TP")
-                _lossSeriesStep = 0;
-            else if (outcome == "SL")
-                _lossSeriesStep = Math.Min(Math.Max(MaxSeriesStep, 1), _lossSeriesStep + 1);
+            UpdateSeriesAfterExit(outcome);
 
             RecordTradeClosed(outcome);
             _lastKnownPosition = GetActivePosition();
@@ -1102,10 +1213,7 @@ namespace CashReaper
 
             var outcome = GetTradeCloseOutcome(myTrade);
 
-            if (outcome == "TP")
-                _lossSeriesStep = 0;
-            else if (outcome == "SL")
-                _lossSeriesStep = Math.Min(Math.Max(MaxSeriesStep, 1), _lossSeriesStep + 1);
+            UpdateSeriesAfterExit(outcome);
 
             RecordTradeEvent(
                 "protective_residual_detected",
@@ -1124,6 +1232,22 @@ namespace CashReaper
             EmergencyFlattenPosition("protective_residual");
         }
 
+        private void UpdateSeriesAfterExit(string outcome)
+        {
+            // A trailing or breakeven stop can close at a profit.
+            if (_exitFillObserved)
+            {
+                if (_lastTradePnlPoints > 0)
+                    _lossSeriesStep = 0;
+                else if (_lastTradePnlPoints < 0)
+                    _lossSeriesStep = Math.Min(Math.Max(MaxSeriesStep, 1), _lossSeriesStep + 1);
+            }
+            else if (outcome == "TP")
+                _lossSeriesStep = 0;
+            else if (outcome == "SL")
+                _lossSeriesStep = Math.Min(Math.Max(MaxSeriesStep, 1), _lossSeriesStep + 1);
+        }
+
         private void CalculateProtectionPrices(decimal basePrice, OrderDirections direction, decimal orderVolume)
         {
             var takeDistance = CalculateTakeProfitDistance(basePrice, orderVolume);
@@ -1138,6 +1262,116 @@ namespace CashReaper
             {
                 _stopLossPrice = basePrice + stopDistance;
                 _takeProfitPrice = basePrice - takeDistance;
+            }
+
+            if (TickSize > 0)
+            {
+                _stopLossPrice = direction == OrderDirections.Buy
+                    ? Math.Floor(_stopLossPrice / TickSize) * TickSize
+                    : Math.Ceiling(_stopLossPrice / TickSize) * TickSize;
+                _takeProfitPrice = direction == OrderDirections.Buy
+                    ? Math.Ceiling(_takeProfitPrice / TickSize) * TickSize
+                    : Math.Floor(_takeProfitPrice / TickSize) * TickSize;
+            }
+        }
+
+        private void UpdateDynamicStop(decimal marketPrice, int closedBar, bool newClosedBar)
+        {
+            if (!UseProtectiveOrders || !_protectiveOrdersSent || _stopLossOrder == null ||
+                GetActivePosition() == 0 ||
+                _entryExecutionPrice <= 0 || marketPrice <= 0 || TickSize <= 0 ||
+                _emergencyClosing || _accountStopClosing || _reversalPending)
+                return;
+
+            if (_stopModificationPending)
+            {
+                if (_stopModificationRequestedBar >= 0 && closedBar - _stopModificationRequestedBar >= 3)
+                {
+                    _stopModificationRequestedBar = -1;
+                    if (IsTerminalOrder(_stopLossOrder))
+                    {
+                        RaiseShowNotification($"{GetInstanceLabel()}: после перестановки нет подтверждённого активного стопа. Закрываю позицию.");
+                        CancelProtectiveOrders();
+                        EmergencyFlattenPosition("stop_modification_unconfirmed");
+                    }
+                    else
+                        RaiseShowNotification($"{GetInstanceLabel()}: перестановка стопа не подтверждена ATAS. Действует прежний стоп; проверьте заявку.");
+                }
+                return;
+            }
+
+            if (IsTerminalOrder(_stopLossOrder))
+                return;
+
+            var isLong = GetActivePosition() > 0;
+            _bestFavorablePrice = _bestFavorablePrice == 0 ? marketPrice :
+                isLong ? Math.Max(_bestFavorablePrice, marketPrice) : Math.Min(_bestFavorablePrice, marketPrice);
+
+            var candidate = _stopLossPrice;
+            if (BreakEvenEnabled && BreakEvenTriggerPoints > 0 && BreakEvenOffsetPoints >= 0 &&
+                (isLong ? _bestFavorablePrice - _entryExecutionPrice : _entryExecutionPrice - _bestFavorablePrice) >= BreakEvenTriggerPoints)
+            {
+                var breakeven = _entryExecutionPrice + (isLong ? BreakEvenOffsetPoints : -BreakEvenOffsetPoints);
+                candidate = isLong ? Math.Max(candidate, breakeven) : Math.Min(candidate, breakeven);
+            }
+
+            if (TrailingDistancePoints > 0)
+            {
+                if (TrailingMode == TrailingStopMode.Price)
+                {
+                    var trailing = _bestFavorablePrice + (isLong ? -TrailingDistancePoints : TrailingDistancePoints);
+                    candidate = isLong ? Math.Max(candidate, trailing) : Math.Min(candidate, trailing);
+                }
+                else if (TrailingMode == TrailingStopMode.ClosedBar && newClosedBar && closedBar > _entrySentBar)
+                {
+                    var completed = GetCandle(closedBar);
+                    var trailing = (isLong ? completed.Low - TrailingDistancePoints : completed.High + TrailingDistancePoints);
+                    candidate = isLong ? Math.Max(candidate, trailing) : Math.Min(candidate, trailing);
+                }
+            }
+
+            candidate = isLong
+                ? Math.Floor(candidate / TickSize) * TickSize
+                : Math.Ceiling(candidate / TickSize) * TickSize;
+
+            // A stop must only tighten, and it must still be beyond the current market price.
+            if (isLong ? candidate <= _stopLossPrice || candidate >= marketPrice - TickSize
+                       : candidate >= _stopLossPrice || candidate <= marketPrice + TickSize)
+                return;
+
+            var originalStop = _stopLossOrder;
+            var previousStopPrice = _stopLossPrice;
+            var stopDirection = originalStop.Direction;
+            var stopQuantity = originalStop.QuantityToFill;
+            var modified = new Order
+            {
+                Portfolio = Portfolio,
+                Security = Security,
+                Direction = stopDirection,
+                Type = OrderTypes.Stop,
+                TriggerPrice = candidate,
+                Price = candidate,
+                QuantityToFill = stopQuantity
+            };
+
+            _requestedStopPrice = candidate;
+            _stopModificationPending = true;
+            _stopModificationRequestedBar = closedBar;
+            _stopReplacementOrder = modified;
+            try
+            {
+                ModifyOrder(originalStop, modified);
+                RecordTradeEvent("stop_move_requested", closedBar, stopDirection.ToString(),
+                    true, $"from={previousStopPrice}; to={candidate}; mode={TrailingMode}; breakeven={BreakEvenEnabled}",
+                    stopQuantity);
+            }
+            catch (Exception ex)
+            {
+                _stopModificationPending = false;
+                _stopReplacementOrder = null;
+                RecordTradeEvent("stop_move_error", closedBar, stopDirection.ToString(),
+                    false, ex.Message, stopQuantity);
+                RaiseShowNotification($"{GetInstanceLabel()}: перестановка стопа отклонена. Старый стоп остаётся: {ex.Message}");
             }
         }
 
@@ -1415,6 +1649,7 @@ namespace CashReaper
 
             _takeProfitOrder = null;
             _stopLossOrder = null;
+            _stopReplacementOrder = null;
             _protectiveOrdersSent = false;
         }
 
@@ -1509,6 +1744,7 @@ namespace CashReaper
             _emergencyOrder = null;
             _takeProfitOrder = null;
             _stopLossOrder = null;
+            _stopReplacementOrder = null;
 
             _entryDirection = default;
             _tradeState = TradeState.Idle;
@@ -1528,6 +1764,11 @@ namespace CashReaper
             _takeProfitPrice = 0;
             _stopLossPrice = 0;
             _entryExecutionPrice = 0;
+            _exitFillObserved = false;
+            _bestFavorablePrice = 0;
+            _stopModificationPending = false;
+            _requestedStopPrice = 0;
+            _stopModificationRequestedBar = -1;
             _activeSignalKey = "";
         }
 
@@ -1705,6 +1946,34 @@ namespace CashReaper
 
             return _instanceId + ":" + bar.ToString(CultureInfo.InvariantCulture) + ":" +
                    GetCandle(bar).LastTime.Ticks.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private bool PassesImbalanceFilter(int bar, OrderDirections direction)
+        {
+            if (!UseImbalanceFilter)
+                return true;
+
+            string status;
+            decimal? directionalPercent = null;
+            try
+            {
+                var stats = GetImbalanceStats(bar);
+                status = stats.Status;
+                directionalPercent = direction == OrderDirections.Buy
+                    ? stats.BuyMaxPercent : stats.SellMaxPercent;
+            }
+            catch (Exception ex)
+            {
+                status = "read_error:" + ex.GetType().Name;
+            }
+
+            if (MinimumImbalancePercent > 0 && status == "ok" &&
+                directionalPercent.HasValue && directionalPercent.Value >= MinimumImbalancePercent)
+                return true;
+
+            RecordTradeEvent("entry_blocked_imbalance", bar, direction.ToString(), false,
+                $"status={status}; directional_pct={directionalPercent}; threshold_pct={MinimumImbalancePercent}", 0m);
+            return false;
         }
 
         private (string Status, decimal? BuyMaxPercent, decimal? SellMaxPercent, int LevelCount) GetImbalanceStats(int bar)
