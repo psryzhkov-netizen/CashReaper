@@ -253,6 +253,7 @@ namespace CashReaper
         private readonly string _instanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
 
         private int _lastProcessedSignalBar = -1;
+        private int _lastExportedClosedBar = -1;
         private int _entrySentBar = -1;
         private int _lastProtectiveRetryBar = -1;
         private DateTime _lastTimeLimitNoticeDate = DateTime.MinValue;
@@ -407,6 +408,8 @@ namespace CashReaper
             _macd[bar] = _fastEma[bar] - _slowEma[bar];
             _signal[bar] = CalcEma(_macd[bar], _signal[bar - 1], SignalPeriod);
             _difference[bar] = _macd[bar] - _signal[bar];
+
+            ExportClosedBars(bar);
 
             if (bar < 2)
                 return;
@@ -1807,6 +1810,51 @@ namespace CashReaper
                 return "doji_previous";
 
             return "bar_direction_filter";
+        }
+
+        // Export every completed chart bar, including bars skipped by trading-state checks.
+        // The next bar proves that the preceding bar is closed; historical callbacks also
+        // backfill any loaded bars whose OnCalculate callback was not delivered individually.
+        private void ExportClosedBars(int bar)
+        {
+            if (!StatisticsCollectorEnabled)
+                return;
+
+            var lastClosedBar = Math.Min(bar - 1, CurrentBar - 2);
+            if (lastClosedBar <= _lastExportedClosedBar)
+                return;
+
+            try
+            {
+                var path = Path.Combine(Path.GetDirectoryName(GetStatisticsPath()),
+                    "CashReaperBars-full-v1.csv");
+                lock (StatsFileLock)
+                {
+                    var fileExists = File.Exists(path);
+                    using (var writer = new StreamWriter(path, append: true))
+                    {
+                        if (!fileExists)
+                            writer.WriteLine("instance,instrument,bar,bar_last_time,open,high,low,close,range_size,tick_size");
+
+                        for (var i = _lastExportedClosedBar + 1; i <= lastClosedBar; i++)
+                        {
+                            var candle = GetCandle(i);
+                            writer.WriteLine(string.Join(",",
+                                Csv(GetInstanceLabel()),
+                                Csv(Security == null ? "" : Security.ToString()),
+                                Csv(i),
+                                Csv(candle.LastTime.ToString("O", CultureInfo.InvariantCulture)),
+                                Csv(candle.Open), Csv(candle.High), Csv(candle.Low), Csv(candle.Close),
+                                Csv(RangeSize), Csv(TickSize)));
+                            _lastExportedClosedBar = i;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                RaiseDebug($"Full bar collector error: {ex.Message}");
+            }
         }
 
         private void RecordBarDecision(
