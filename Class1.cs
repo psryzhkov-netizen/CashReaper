@@ -1834,7 +1834,7 @@ namespace CashReaper
                     using (var writer = new StreamWriter(path, append: true))
                     {
                         if (!fileExists)
-                            writer.WriteLine("instance,instrument,bar,bar_last_time,open,high,low,close,range_size,tick_size");
+                            writer.WriteLine("instance,instrument,bar,bar_last_time,open,high,low,close,volume,ticks,bid,ask,delta,range_size,tick_size");
 
                         for (var i = _lastExportedClosedBar + 1; i <= lastClosedBar; i++)
                         {
@@ -1845,6 +1845,8 @@ namespace CashReaper
                                 Csv(i),
                                 Csv(candle.LastTime.ToString("O", CultureInfo.InvariantCulture)),
                                 Csv(candle.Open), Csv(candle.High), Csv(candle.Low), Csv(candle.Close),
+                                Csv(candle.Volume), Csv(candle.Ticks), Csv(candle.Bid),
+                                Csv(candle.Ask), Csv(candle.Delta),
                                 Csv(RangeSize), Csv(TickSize)));
                             _lastExportedClosedBar = i;
                         }
