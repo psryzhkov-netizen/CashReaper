@@ -76,7 +76,7 @@ try {
     }
     if ($null -eq $state.files) { $state.files = @() }
 
-    $files = Get-ChildItem -LiteralPath $dataDir -Filter '*imbalance-v1.csv' -File
+    $files = Get-ChildItem -LiteralPath $dataDir -Filter 'CashReaper*-v1.csv' -File
 
     foreach ($file in $files) {
         $entry = @($state.files | Where-Object { $_.path -eq $file.FullName }) | Select-Object -First 1

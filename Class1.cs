@@ -154,6 +154,9 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Use MACD filter", Description = "MACD filters new entries only: long when difference > 0, short when difference < 0. An opposite body engulfing always closes the current position, even when MACD disagrees.", Order = 201)]
         public bool UseMacdFilter { get; set; } = true;
 
+        [Display(GroupName = "07. Signal", Name = "One entry per MACD difference crossing", Description = "Allow at most one filled long after difference crosses from negative to positive, and one filled short after it crosses from positive to negative. A new crossing rearms that direction.", Order = 204)]
+        public bool OneEntryPerMacdCrossing { get; set; } = false;
+
         [Display(GroupName = "07. Signal", Name = "Use imbalance filter", Description = "Require directional diagonal footprint imbalance on the closed signal bar. If footprint data is unavailable, skip the entry.", Order = 202)]
         public bool UseImbalanceFilter { get; set; } = false;
 
@@ -253,6 +256,14 @@ namespace CashReaper
         private readonly string _instanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
 
         private int _lastProcessedSignalBar = -1;
+        private int _lastExportedClosedBar = -1;
+        private int _lastMacdCrossCheckedBar = -1;
+        private int _lastNonZeroDifferenceSign;
+        private int _lastPositiveCrossBar = -1;
+        private int _lastNegativeCrossBar = -1;
+        private int _consumedPositiveCrossBar = -1;
+        private int _consumedNegativeCrossBar = -1;
+        private int _pendingEntryMacdCrossBar = -1;
         private int _entrySentBar = -1;
         private int _lastProtectiveRetryBar = -1;
         private DateTime _lastTimeLimitNoticeDate = DateTime.MinValue;
@@ -320,6 +331,14 @@ namespace CashReaper
 
         protected override void OnStarted()
         {
+            // A restart must not reuse an old positive/negative regime for another entry.
+            _lastMacdCrossCheckedBar = -1;
+            _lastNonZeroDifferenceSign = 0;
+            _lastPositiveCrossBar = -1;
+            _lastNegativeCrossBar = -1;
+            _consumedPositiveCrossBar = -1;
+            _consumedNegativeCrossBar = -1;
+            _pendingEntryMacdCrossBar = -1;
             _trackedPosition = CurrentPosition;
             _moneyEstimatePosition = CurrentPosition;
             _lastKnownPosition = GetActivePosition();
@@ -362,7 +381,7 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; " +
+                $"macd_filter={UseMacdFilter}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; " +
                 $"breakeven={BreakEvenEnabled}/{BreakEvenTriggerPoints}/{BreakEvenOffsetPoints}; trailing={TrailingMode}/{TrailingDistancePoints}; " +
                 $"reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
         }
@@ -407,6 +426,8 @@ namespace CashReaper
             _macd[bar] = _fastEma[bar] - _slowEma[bar];
             _signal[bar] = CalcEma(_macd[bar], _signal[bar - 1], SignalPeriod);
             _difference[bar] = _macd[bar] - _signal[bar];
+
+            ExportClosedBars(bar);
 
             if (bar < 2)
                 return;
@@ -684,8 +705,60 @@ namespace CashReaper
             RaiseDebug($"Не удалось отменить заявку. {message}");
         }
 
+        private void UpdateMacdCrossingState(int bar)
+        {
+            if (!OneEntryPerMacdCrossing || bar < 1 || bar <= _lastMacdCrossCheckedBar)
+                return;
+
+            if (_lastMacdCrossCheckedBar < 0)
+            {
+                // Ignore old crosses when the strategy is attached mid-regime.
+                for (var i = bar - 1; i >= 0; i--)
+                {
+                    if (_difference[i] == 0)
+                        continue;
+                    _lastNonZeroDifferenceSign = _difference[i] > 0 ? 1 : -1;
+                    break;
+                }
+                _lastMacdCrossCheckedBar = bar - 1;
+            }
+
+            for (var i = _lastMacdCrossCheckedBar + 1; i <= bar; i++)
+            {
+                var sign = _difference[i] > 0 ? 1 : _difference[i] < 0 ? -1 : 0;
+                if (sign == 0)
+                    continue;
+
+                if (_lastNonZeroDifferenceSign < 0 && sign > 0)
+                    _lastPositiveCrossBar = i;
+                else if (_lastNonZeroDifferenceSign > 0 && sign < 0)
+                    _lastNegativeCrossBar = i;
+
+                _lastNonZeroDifferenceSign = sign;
+            }
+
+            _lastMacdCrossCheckedBar = bar;
+        }
+
+        private bool CanEnterMacdCycle(OrderDirections direction, int signalBar)
+        {
+            if (!OneEntryPerMacdCrossing)
+                return true;
+
+            if (direction == OrderDirections.Buy)
+                return _difference[signalBar] > 0 &&
+                    _lastPositiveCrossBar >= 0 && _lastPositiveCrossBar <= signalBar &&
+                    _lastPositiveCrossBar > _consumedPositiveCrossBar;
+
+            return _difference[signalBar] < 0 &&
+                _lastNegativeCrossBar >= 0 && _lastNegativeCrossBar <= signalBar &&
+                _lastNegativeCrossBar > _consumedNegativeCrossBar;
+        }
+
         private void CheckSignal(int bar)
         {
+            UpdateMacdCrossingState(bar);
+
             if (_reversalPending)
             {
                 RecordBarDecision(bar, null, null, 0, false, "", false, "reversal_close_pending");
@@ -725,8 +798,8 @@ namespace CashReaper
                 previousBullish &&
                 engulf;
 
-            var isLong = bullishEngulfing && (!UseMacdFilter || diff > 0);
-            var isShort = bearishEngulfing && (!UseMacdFilter || diff < 0);
+            var isLong = bullishEngulfing && ((!UseMacdFilter && !OneEntryPerMacdCrossing) || diff > 0);
+            var isShort = bearishEngulfing && ((!UseMacdFilter && !OneEntryPerMacdCrossing) || diff < 0);
 
             var activePosition = GetActivePosition();
 
@@ -766,6 +839,11 @@ namespace CashReaper
 
             if (isLong)
             {
+                if (!CanEnterMacdCycle(OrderDirections.Buy, bar))
+                {
+                    RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "macd_positive_cycle_unavailable");
+                    return;
+                }
                 if (!PassesImbalanceFilter(bar, OrderDirections.Buy))
                 {
                     RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "imbalance_filter");
@@ -778,6 +856,11 @@ namespace CashReaper
 
             if (isShort)
             {
+                if (!CanEnterMacdCycle(OrderDirections.Sell, bar))
+                {
+                    RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", false, "macd_negative_cycle_unavailable");
+                    return;
+                }
                 if (!PassesImbalanceFilter(bar, OrderDirections.Sell))
                 {
                     RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", false, "imbalance_filter");
@@ -799,6 +882,13 @@ namespace CashReaper
         private void ProcessSignal(OrderDirections direction, string signalName, int bar, decimal diff,
             bool imbalanceChecked = false)
         {
+            if (!CanEnterMacdCycle(direction, bar))
+            {
+                RecordTradeEvent("entry_blocked", bar, direction.ToString(), false,
+                    "macd_crossing_cycle_unavailable", 0m);
+                return;
+            }
+
             if (!imbalanceChecked && !PassesImbalanceFilter(bar, direction))
                 return;
 
@@ -838,6 +928,9 @@ namespace CashReaper
                 return;
 
             _activeSignalKey = GetSignalKey(bar);
+            _pendingEntryMacdCrossBar = OneEntryPerMacdCrossing
+                ? direction == OrderDirections.Buy ? _lastPositiveCrossBar : _lastNegativeCrossBar
+                : -1;
             SendEntryOrder(direction);
         }
 
@@ -903,6 +996,13 @@ namespace CashReaper
             {
                 RecordTradeEvent("reversal_entry_blocked", signalBar, direction.ToString(), false,
                     $"macd_direction_filter; difference={_difference[signalBar]}; position_closed=1", 0m);
+                return;
+            }
+
+            if (!CanEnterMacdCycle(direction, signalBar))
+            {
+                RecordTradeEvent("reversal_entry_blocked", signalBar, direction.ToString(), false,
+                    "macd_crossing_cycle_unavailable; position_closed=1", 0m);
                 return;
             }
 
@@ -1001,6 +1101,19 @@ namespace CashReaper
             _tradeState = TradeState.PositionOpen;
             _lastKnownPosition = activePosition;
             RecordTradeEvent("entry_filled", _lastProcessedSignalBar, _entryDirection.ToString(), true, "position_open", Math.Abs(activePosition));
+
+            if (OneEntryPerMacdCrossing && _pendingEntryMacdCrossBar >= 0)
+            {
+                if (_entryDirection == OrderDirections.Buy)
+                    _consumedPositiveCrossBar = Math.Max(_consumedPositiveCrossBar, _pendingEntryMacdCrossBar);
+                else
+                    _consumedNegativeCrossBar = Math.Max(_consumedNegativeCrossBar, _pendingEntryMacdCrossBar);
+
+                RecordTradeEvent("macd_crossing_consumed", _lastProcessedSignalBar,
+                    _entryDirection.ToString(), true,
+                    $"cross_bar={_pendingEntryMacdCrossBar}; entry_filled=1", Math.Abs(activePosition));
+                _pendingEntryMacdCrossBar = -1;
+            }
 
             RaiseShowNotification(
                 UseProtectiveOrders
@@ -1770,6 +1883,7 @@ namespace CashReaper
             _requestedStopPrice = 0;
             _stopModificationRequestedBar = -1;
             _activeSignalKey = "";
+            _pendingEntryMacdCrossBar = -1;
         }
 
         private void RaiseDebug(string message)
@@ -1807,6 +1921,53 @@ namespace CashReaper
                 return "doji_previous";
 
             return "bar_direction_filter";
+        }
+
+        // Export every completed chart bar, including bars skipped by trading-state checks.
+        // The next bar proves that the preceding bar is closed; historical callbacks also
+        // backfill any loaded bars whose OnCalculate callback was not delivered individually.
+        private void ExportClosedBars(int bar)
+        {
+            if (!StatisticsCollectorEnabled)
+                return;
+
+            var lastClosedBar = Math.Min(bar - 1, CurrentBar - 2);
+            if (lastClosedBar <= _lastExportedClosedBar)
+                return;
+
+            try
+            {
+                var path = Path.Combine(Path.GetDirectoryName(GetStatisticsPath()),
+                    "CashReaperBars-full-v1.csv");
+                lock (StatsFileLock)
+                {
+                    var fileExists = File.Exists(path);
+                    using (var writer = new StreamWriter(path, append: true))
+                    {
+                        if (!fileExists)
+                            writer.WriteLine("instance,instrument,bar,bar_last_time,open,high,low,close,volume,ticks,bid,ask,delta,range_size,tick_size");
+
+                        for (var i = _lastExportedClosedBar + 1; i <= lastClosedBar; i++)
+                        {
+                            var candle = GetCandle(i);
+                            writer.WriteLine(string.Join(",",
+                                Csv(GetInstanceLabel()),
+                                Csv(Security == null ? "" : Security.ToString()),
+                                Csv(i),
+                                Csv(candle.LastTime.ToString("O", CultureInfo.InvariantCulture)),
+                                Csv(candle.Open), Csv(candle.High), Csv(candle.Low), Csv(candle.Close),
+                                Csv(candle.Volume), Csv(candle.Ticks), Csv(candle.Bid),
+                                Csv(candle.Ask), Csv(candle.Delta),
+                                Csv(RangeSize), Csv(TickSize)));
+                            _lastExportedClosedBar = i;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                RaiseDebug($"Full bar collector error: {ex.Message}");
+            }
         }
 
         private void RecordBarDecision(
