@@ -163,6 +163,12 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Minimum imbalance %", Description = "Long: maximum Ask/Bid imbalance; Short: maximum Bid/Ask imbalance on the signal bar.", Order = 203)]
         public decimal MinimumImbalancePercent { get; set; } = 10000m;
 
+        [Display(GroupName = "07. Signal", Name = "Use Delta filter", Description = "Require directional Delta strictly above the threshold on the closed signal bar. If bar volume is unavailable, skip the entry.", Order = 205)]
+        public bool UseDeltaFilter { get; set; } = false;
+
+        [Display(GroupName = "07. Signal", Name = "Minimum directional Delta %", Description = "100 * Delta / Volume for long; -100 * Delta / Volume for short. Entry requires a value strictly greater than this threshold.", Order = 206)]
+        public decimal MinimumDirectionalDeltaPercent { get; set; } = 50m;
+
         [Display(GroupName = "08. TP/SL", Name = "TP/SL mode", Order = 250)]
         public ProtectionMode ProtectionCalculationMode { get; set; } = ProtectionMode.Points;
 
@@ -389,7 +395,7 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; " +
+                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; delta_rule=directional_strictly_greater; " +
                 $"breakeven={BreakEvenEnabled}/{BreakEvenTriggerPoints}/{BreakEvenOffsetPoints}; trailing={TrailingMode}/{TrailingDistancePoints}; " +
                 $"reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
         }
@@ -853,6 +859,11 @@ namespace CashReaper
                     RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "macd_positive_cycle_unavailable");
                     return;
                 }
+                if (!PassesDeltaFilter(bar, OrderDirections.Buy))
+                {
+                    RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "delta_filter");
+                    return;
+                }
                 if (!PassesImbalanceFilter(bar, OrderDirections.Buy))
                 {
                     RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "imbalance_filter");
@@ -868,6 +879,11 @@ namespace CashReaper
                 if (!CanEnterMacdCycle(OrderDirections.Sell, bar))
                 {
                     RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", false, "macd_negative_cycle_unavailable");
+                    return;
+                }
+                if (!PassesDeltaFilter(bar, OrderDirections.Sell))
+                {
+                    RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", false, "delta_filter");
                     return;
                 }
                 if (!PassesImbalanceFilter(bar, OrderDirections.Sell))
@@ -889,7 +905,7 @@ namespace CashReaper
         }
 
         private void ProcessSignal(OrderDirections direction, string signalName, int bar, decimal diff,
-            bool imbalanceChecked = false)
+            bool filtersChecked = false)
         {
             if (!CanEnterMacdCycle(direction, bar))
             {
@@ -898,8 +914,11 @@ namespace CashReaper
                 return;
             }
 
-            if (!imbalanceChecked && !PassesImbalanceFilter(bar, direction))
-                return;
+            if (!filtersChecked)
+            {
+                if (!PassesDeltaFilter(bar, direction) || !PassesImbalanceFilter(bar, direction))
+                    return;
+            }
 
             var signalCandle = GetCandle(bar);
 
@@ -998,6 +1017,9 @@ namespace CashReaper
             _reversalPending = false;
             _pendingReversalBar = -1;
             ResetTradeState();
+
+            FinalizeMacdThrough(signalBar);
+            UpdateMacdCrossingState(signalBar);
 
             if (UseMacdFilter && (direction == OrderDirections.Buy
                     ? _difference[signalBar] <= 0
@@ -2116,6 +2138,46 @@ namespace CashReaper
 
             return _instanceId + ":" + bar.ToString(CultureInfo.InvariantCulture) + ":" +
                    GetCandle(bar).LastTime.Ticks.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private bool PassesDeltaFilter(int bar, OrderDirections direction)
+        {
+            if (!UseDeltaFilter)
+                return true;
+
+            var status = "ok";
+            decimal delta = 0m;
+            decimal volume = 0m;
+            decimal? directionalPercent = null;
+            try
+            {
+                if (bar < 0 || bar >= CurrentBar)
+                    status = "unavailable";
+                else
+                {
+                    var candle = GetCandle(bar);
+                    delta = candle.Delta;
+                    volume = candle.Volume;
+                    if (volume <= 0m)
+                        status = "no_volume";
+                    else if (delta > volume || delta < -volume)
+                        status = "invalid_delta";
+                    else
+                        directionalPercent = 100m * (direction == OrderDirections.Buy ? delta : -delta) / volume;
+                }
+            }
+            catch (Exception ex)
+            {
+                status = "read_error:" + ex.GetType().Name;
+            }
+
+            if (status == "ok" && directionalPercent.HasValue &&
+                directionalPercent.Value > MinimumDirectionalDeltaPercent)
+                return true;
+
+            RecordTradeEvent("entry_blocked_delta", bar, direction.ToString(), false,
+                $"status={status}; directional_pct={directionalPercent}; threshold_pct={MinimumDirectionalDeltaPercent}; delta={delta}; volume={volume}", 0m);
+            return false;
         }
 
         private bool PassesImbalanceFilter(int bar, OrderDirections direction)
