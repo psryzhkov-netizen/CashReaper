@@ -252,6 +252,10 @@ namespace CashReaper
         private decimal[] _macd = Array.Empty<decimal>();
         private decimal[] _signal = Array.Empty<decimal>();
         private decimal[] _difference = Array.Empty<decimal>();
+        private int _lastFinalizedMacdBar = -1;
+        private int _finalizedFastPeriod = -1;
+        private int _finalizedSlowPeriod = -1;
+        private int _finalizedSignalPeriod = -1;
 
         private readonly string _instanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
 
@@ -331,6 +335,10 @@ namespace CashReaper
 
         protected override void OnStarted()
         {
+            _lastFinalizedMacdBar = -1;
+            _finalizedFastPeriod = -1;
+            _finalizedSlowPeriod = -1;
+            _finalizedSignalPeriod = -1;
             // A restart must not reuse an old positive/negative regime for another entry.
             _lastMacdCrossCheckedBar = -1;
             _lastNonZeroDifferenceSign = 0;
@@ -381,7 +389,7 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; " +
+                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; " +
                 $"breakeven={BreakEvenEnabled}/{BreakEvenTriggerPoints}/{BreakEvenOffsetPoints}; trailing={TrailingMode}/{TrailingDistancePoints}; " +
                 $"reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
         }
@@ -442,6 +450,7 @@ namespace CashReaper
             CheckAccountLimits(bar);
 
             var signalBar = bar - 1;
+            FinalizeMacdThrough(signalBar);
             UpdateDynamicStop(candle.Close, signalBar, signalBar > _lastProcessedSignalBar);
 
             if (signalBar <= _lastProcessedSignalBar)
@@ -2703,6 +2712,54 @@ namespace CashReaper
             Array.Resize(ref _macd, size);
             Array.Resize(ref _signal, size);
             Array.Resize(ref _difference, size);
+        }
+
+        private void FinalizeMacdThrough(int lastClosedBar)
+        {
+            if (lastClosedBar < 0)
+                return;
+
+            if (_finalizedFastPeriod != FastPeriod || _finalizedSlowPeriod != SlowPeriod ||
+                _finalizedSignalPeriod != SignalPeriod)
+            {
+                if (_lastFinalizedMacdBar >= 0)
+                    RecordTradeEvent("macd_settings_changed", lastClosedBar, "", true,
+                        $"old={_finalizedFastPeriod}/{_finalizedSlowPeriod}/{_finalizedSignalPeriod}; new={FastPeriod}/{SlowPeriod}/{SignalPeriod}; source=Close", 0m);
+
+                _lastFinalizedMacdBar = -1;
+                _finalizedFastPeriod = FastPeriod;
+                _finalizedSlowPeriod = SlowPeriod;
+                _finalizedSignalPeriod = SignalPeriod;
+                _lastMacdCrossCheckedBar = -1;
+                _lastNonZeroDifferenceSign = 0;
+                _lastPositiveCrossBar = -1;
+                _lastNegativeCrossBar = -1;
+                _consumedPositiveCrossBar = -1;
+                _consumedNegativeCrossBar = -1;
+            }
+
+            EnsureSize(lastClosedBar + 1);
+            if (_lastFinalizedMacdBar < 0)
+            {
+                var firstClose = GetCandle(0).Close;
+                _fastEma[0] = firstClose;
+                _slowEma[0] = firstClose;
+                _macd[0] = 0m;
+                _signal[0] = 0m;
+                _difference[0] = 0m;
+            }
+
+            for (var i = Math.Max(1, _lastFinalizedMacdBar + 1); i <= lastClosedBar; i++)
+            {
+                var close = GetCandle(i).Close;
+                _fastEma[i] = CalcEma(close, _fastEma[i - 1], FastPeriod);
+                _slowEma[i] = CalcEma(close, _slowEma[i - 1], SlowPeriod);
+                _macd[i] = _fastEma[i] - _slowEma[i];
+                _signal[i] = CalcEma(_macd[i], _signal[i - 1], SignalPeriod);
+                _difference[i] = _macd[i] - _signal[i];
+            }
+
+            _lastFinalizedMacdBar = lastClosedBar;
         }
 
         private decimal CalcEma(decimal value, decimal previousEma, int period)
