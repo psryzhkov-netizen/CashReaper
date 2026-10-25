@@ -83,7 +83,7 @@ namespace CashReaper
         public bool RestoreProtectiveOrdersOnStart { get; set; } = true;
 
         [Display(GroupName = "04. Time filter", Name = "Use trading pause", Order = 80)]
-        public bool TradingTimeLimitEnabled { get; set; } = true;
+        public bool TradingTimeLimitEnabled { get; set; } = false;
 
         [Display(GroupName = "04. Time filter", Name = "Trade on Saturday", Description = "Allow new entries on Saturday in chart time. Existing positions remain protected.", Order = 81)]
         public bool TradeOnSaturday { get; set; } = false;
@@ -122,7 +122,7 @@ namespace CashReaper
         public MoneyPnlSource DailyMoneyPnlSource { get; set; } = MoneyPnlSource.AtasPortfolio;
 
         [Display(GroupName = "06. Series sizing", Name = "Use series sizing", Order = 150)]
-        public bool SeriesSizingEnabled { get; set; } = true;
+        public bool SeriesSizingEnabled { get; set; } = false;
 
         [Display(GroupName = "03. Recovery", Name = "Entry timeout bars", Order = 90)]
         public int EntryRecoveryBars { get; set; } = 3;
@@ -155,7 +155,7 @@ namespace CashReaper
         public bool UseMacdFilter { get; set; } = true;
 
         [Display(GroupName = "07. Signal", Name = "One entry per MACD difference crossing", Description = "Allow at most one filled long after difference crosses from negative to positive, and one filled short after it crosses from positive to negative. A new crossing rearms that direction.", Order = 204)]
-        public bool OneEntryPerMacdCrossing { get; set; } = false;
+        public bool OneEntryPerMacdCrossing { get; set; } = true;
 
         [Display(GroupName = "07. Signal", Name = "Use imbalance filter", Description = "Require directional diagonal footprint imbalance on the closed signal bar. If footprint data is unavailable, skip the entry.", Order = 202)]
         public bool UseImbalanceFilter { get; set; } = false;
@@ -182,31 +182,31 @@ namespace CashReaper
         public int MaxSeriesStep { get; set; } = 15;
 
         [Display(GroupName = "07. Signal", Name = "MACD fast period", Order = 210)]
-        public int FastPeriod { get; set; } = 12;
+        public int FastPeriod { get; set; } = 48;
 
         [Display(GroupName = "07. Signal", Name = "MACD slow period", Order = 220)]
-        public int SlowPeriod { get; set; } = 26;
+        public int SlowPeriod { get; set; } = 104;
 
         [Display(GroupName = "07. Signal", Name = "MACD signal period", Order = 230)]
-        public int SignalPeriod { get; set; } = 9;
+        public int SignalPeriod { get; set; } = 36;
 
         [Display(GroupName = "01. Trading", Name = "Base volume", Order = 11)]
-        public decimal Volume { get; set; } = 0.1m;
+        public decimal Volume { get; set; } = 2m;
 
         [Display(GroupName = "01. Trading", Name = "Min volume", Order = 12)]
-        public decimal MinVolume { get; set; } = 0.1m;
+        public decimal MinVolume { get; set; } = 2m;
 
         [Display(GroupName = "01. Trading", Name = "Max volume (0 = off)", Order = 13)]
         public decimal MaxVolume { get; set; } = 0m;
 
         [Display(GroupName = "01. Trading", Name = "Volume step", Order = 14)]
-        public decimal VolumeStep { get; set; } = 0.1m;
+        public decimal VolumeStep { get; set; } = 2m;
 
         [Display(GroupName = "08. TP/SL", Name = "Take profit points", Order = 260)]
-        public decimal TakeProfitPoints { get; set; } = 0.31m;
+        public decimal TakeProfitPoints { get; set; } = 0.21m;
 
         [Display(GroupName = "08. TP/SL", Name = "Stop loss points", Order = 270)]
-        public decimal StopLossPoints { get; set; } = 0.25m;
+        public decimal StopLossPoints { get; set; } = 0.2m;
 
         [Display(GroupName = "08. TP/SL", Name = "Move stop to breakeven", Order = 271)]
         public bool BreakEvenEnabled { get; set; } = false;
