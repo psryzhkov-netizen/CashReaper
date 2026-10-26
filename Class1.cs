@@ -4,6 +4,7 @@ using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.IO;
 using ATAS.DataFeedsCore;
+using ATAS.Indicators;
 using ATAS.Strategies.Chart;
 
 namespace CashReaper
@@ -69,6 +70,9 @@ namespace CashReaper
 
         [Display(GroupName = "02. Replay and diagnostics", Name = "Collect signal footprints", Description = "Record Bid/Ask at every price level of an engulfing signal bar for offline imbalance analysis. Does not affect orders.", Order = 31)]
         public bool FootprintCollectorEnabled { get; set; } = true;
+
+        [Display(GroupName = "02. Replay and diagnostics", Name = "Collect replay ticks", Description = "Record each OnNewTrade print for offline replay. Enable only for a diagnostic Market Replay; this can create a large CSV file.", Order = 32)]
+        public bool TickCollectorEnabled { get; set; } = false;
 
         [Display(GroupName = "02. Replay and diagnostics", Name = "Debug notifications", Order = 40)]
         public bool DebugMode { get; set; } = true;
@@ -333,6 +337,8 @@ namespace CashReaper
         private decimal _lastKnownPosition;
         private decimal _trackedPosition;
         private int _lossSeriesStep;
+        private readonly List<string> _tickBuffer = new List<string>(512);
+        private long _tickSequence;
 
         public CashReaperStrategy() : base(true)
         {
@@ -402,6 +408,7 @@ namespace CashReaper
 
         protected override void OnStopping()
         {
+            FlushTickBuffer();
             _reversalPending = false;
             CancelProtectiveOrders();
 
@@ -417,6 +424,62 @@ namespace CashReaper
             }
 
             base.OnStopping();
+        }
+
+        protected override void OnNewTrade(MarketDataArg arg)
+        {
+            if (TickCollectorEnabled && arg != null && arg.DataType.ToString() == "Trade")
+            {
+                lock (_tickBuffer)
+                {
+                    _tickBuffer.Add(string.Join(",",
+                        Csv(GetInstanceLabel()),
+                        Csv(Security == null ? "" : Security.ToString()),
+                        Csv(++_tickSequence),
+                        Csv(arg.Time.ToString("O", CultureInfo.InvariantCulture)),
+                        Csv(arg.Price), Csv(arg.Volume), Csv(arg.Direction),
+                        Csv(Math.Max(0, CurrentBar - 1))));
+
+                    if (_tickBuffer.Count >= 512)
+                        FlushTickBufferLocked();
+                }
+            }
+
+            base.OnNewTrade(arg);
+        }
+
+        private void FlushTickBuffer()
+        {
+            lock (_tickBuffer)
+                FlushTickBufferLocked();
+        }
+
+        private void FlushTickBufferLocked()
+        {
+            if (_tickBuffer.Count == 0)
+                return;
+
+            try
+            {
+                var path = Path.Combine(Path.GetDirectoryName(GetStatisticsPath()), "CashReaperTicks-v1.csv");
+                lock (StatsFileLock)
+                {
+                    var fileExists = File.Exists(path);
+                    using (var writer = new StreamWriter(path, append: true))
+                    {
+                        if (!fileExists)
+                            writer.WriteLine("instance,instrument,sequence,time,price,volume,direction,chart_bar");
+                        foreach (var line in _tickBuffer)
+                            writer.WriteLine(line);
+                    }
+                }
+
+                _tickBuffer.Clear();
+            }
+            catch (Exception ex)
+            {
+                RaiseDebug($"Tick collector error: {ex.Message}");
+            }
         }
 
         protected override void OnCalculate(int bar, decimal value)
