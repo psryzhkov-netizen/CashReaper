@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import mmap
 import re
 from collections import Counter
 from decimal import Decimal, InvalidOperation
@@ -28,20 +29,32 @@ def number(value: str) -> Decimal | None:
         return None
 
 
-def chunks(root: Path, prefix: str, instance: str) -> list[tuple[int, int, Path]]:
+def chunks(root: Path, prefix: str) -> list[tuple[int, int, Path]]:
     found = []
     for path in root.glob(prefix + "-v1-*.csv"):
         match = CHUNK_PATTERN.search(path.name)
         if not match:
             continue
-        with path.open(newline="", encoding="utf-8-sig", errors="replace") as stream:
-            first = next(csv.DictReader(stream), None)
-        if first and instance in first.get("instance", ""):
-            found.append((int(match[1]), int(match[2]), path))
+        found.append((int(match[1]), int(match[2]), path))
     return sorted(found)
 
 
-def audit_stream_ranges(files: list[tuple[int, int, Path]]) -> dict:
+def select_chunks(files: list[tuple[int, int, Path]], instance: str) -> list[tuple[int, int, Path]]:
+    """A bridge chunk may contain rows from several strategy instances."""
+    selected = []
+    needle = instance.encode("utf-8")
+    for item in files:
+        path = item[2]
+        if not path.stat().st_size:
+            continue
+        with path.open("rb") as stream:
+            with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                if data.find(needle) >= 0:
+                    selected.append(item)
+    return selected
+
+
+def audit_stream_ranges(files: list[tuple[int, int, Path]], selected_files: int) -> dict:
     gaps = []
     overlaps = []
     for previous, current in zip(files, files[1:]):
@@ -49,22 +62,29 @@ def audit_stream_ranges(files: list[tuple[int, int, Path]]) -> dict:
             gaps.append([previous[1], current[0]])
         elif current[0] < previous[1]:
             overlaps.append([current[0], previous[1]])
-    return {"files": len(files), "byte_gaps": gaps[:20], "byte_overlaps": overlaps[:20]}
+    return {"files": len(files), "selected_files": selected_files,
+            "byte_gaps": gaps[:20], "byte_overlaps": overlaps[:20]}
 
 
-def read_rows(files: list[tuple[int, int, Path]]):
+def read_rows(files: list[tuple[int, int, Path]], instance: str):
     for _, _, path in files:
         with path.open(newline="", encoding="utf-8-sig", errors="replace") as stream:
             for row in csv.DictReader(stream):
-                yield row
+                if instance in row.get("instance", ""):
+                    yield row
 
 
 def audit(root: Path, instance: str) -> dict:
-    stats_files = chunks(root, "CashReaperStats-imbalance", instance)
-    bar_files = chunks(root, "CashReaperBars-full", instance)
-    footprint_files = chunks(root, "CashReaperFootprint-imbalance", instance)
-    tick_files = chunks(root, "CashReaperTicks", instance)
-    market_files = chunks(root, "CashReaperMarketEvents", instance)
+    all_stats = chunks(root, "CashReaperStats-imbalance")
+    all_bars = chunks(root, "CashReaperBars-full")
+    all_footprints = chunks(root, "CashReaperFootprint-imbalance")
+    all_ticks = chunks(root, "CashReaperTicks")
+    all_market = chunks(root, "CashReaperMarketEvents")
+    stats_files = select_chunks(all_stats, instance)
+    bar_files = select_chunks(all_bars, instance)
+    footprint_files = select_chunks(all_footprints, instance)
+    tick_files = select_chunks(all_ticks, instance)
+    market_files = select_chunks(all_market, instance)
     issues = []
     if not stats_files:
         issues.append("no_statistics_chunks")
@@ -76,7 +96,7 @@ def audit(root: Path, instance: str) -> dict:
     revised_bars = 0
     bar_segments = 1
     previous_index = None
-    for row in read_rows(bar_files):
+    for row in read_rows(bar_files, instance):
         key = row.get("bar", "")
         if not key.isdigit():
             issues.append("invalid_bar_index")
@@ -104,7 +124,7 @@ def audit(root: Path, instance: str) -> dict:
             issues.append("missing_bar_indices")
     segments = [[]]
     previous_chart_time = None
-    for row in read_rows(stats_files):
+    for row in read_rows(stats_files, instance):
         chart_time = row.get("chart_time", "")
         if previous_chart_time and chart_time and chart_time < previous_chart_time:
             segments.append([])
@@ -187,7 +207,7 @@ def audit(root: Path, instance: str) -> dict:
     first_tick_time = None
     last_tick_time = None
     previous_tick_sequence = None
-    for row in read_rows(tick_files):
+    for row in read_rows(tick_files, instance):
         tick_count += 1
         tick_time = row.get("time", "")
         sequence = row.get("sequence", "")
@@ -204,10 +224,13 @@ def audit(root: Path, instance: str) -> dict:
         issues.append("tick_sequence_gaps")
 
     market_event_counts = Counter()
+    trade_ticks_by_bar = Counter()
     market_sequence_gaps = 0
     previous_market_sequence = None
-    for row in read_rows(market_files):
+    for row in read_rows(market_files, instance):
         market_event_counts[row.get("kind", "")] += 1
+        if row.get("kind") == "trade" and row.get("chart_bar", "").isdigit():
+            trade_ticks_by_bar[int(row["chart_bar"])] += 1
         sequence = row.get("sequence", "")
         if previous_market_sequence is not None and sequence.isdigit() and int(sequence) != previous_market_sequence + 1:
             market_sequence_gaps += 1
@@ -215,6 +238,28 @@ def audit(root: Path, instance: str) -> dict:
             previous_market_sequence = int(sequence)
     if market_sequence_gaps:
         issues.append("market_event_sequence_gaps")
+
+    tick_bar_mismatches = []
+    compared_tick_bars = 0
+    if trade_ticks_by_bar:
+        first_event_bar = min(trade_ticks_by_bar)
+        last_event_bar = max(trade_ticks_by_bar)
+        for bar_index in range(first_event_bar + 1, last_event_bar):
+            market_bar = bars.get(bar_index)
+            if market_bar is None:
+                continue
+            expected = market_bar.get("ticks", "")
+            if not expected.isdigit():
+                continue
+            compared_tick_bars += 1
+            if trade_ticks_by_bar[bar_index] != int(expected):
+                tick_bar_mismatches.append({
+                    "bar": bar_index,
+                    "recorded_trades": trade_ticks_by_bar[bar_index],
+                    "atas_bar_ticks": int(expected),
+                })
+    if tick_bar_mismatches:
+        issues.append("trade_tick_count_mismatch")
 
     pnl = sum((number(row.get("last_trade_pnl_points", "")) or Decimal(0) for row in closes), Decimal(0))
     final_pnl = number(closes[-1].get("total_pnl_points", "")) if closes else None
@@ -231,11 +276,11 @@ def audit(root: Path, instance: str) -> dict:
         "ready_for_parameter_search": False,
         "reason_not_ready": "strategy_replay_not_yet_validated; intrabar_order_unavailable",
         "streams": {
-            "statistics": audit_stream_ranges(stats_files),
-            "bars": audit_stream_ranges(bar_files),
-            "footprints": audit_stream_ranges(footprint_files),
-            "ticks": audit_stream_ranges(tick_files),
-            "market_events": audit_stream_ranges(market_files),
+            "statistics": audit_stream_ranges(all_stats, len(stats_files)),
+            "bars": audit_stream_ranges(all_bars, len(bar_files)),
+            "footprints": audit_stream_ranges(all_footprints, len(footprint_files)),
+            "ticks": audit_stream_ranges(all_ticks, len(tick_files)),
+            "market_events": audit_stream_ranges(all_market, len(market_files)),
         },
         "market_events": {
             "counts_by_kind": dict(market_event_counts),
@@ -245,6 +290,9 @@ def audit(root: Path, instance: str) -> dict:
             "has_initial_depth_snapshot": market_event_counts["snapshot_begin"] > 0
                 and market_event_counts["snapshot"] > 0
                 and market_event_counts["snapshot_end"] > 0,
+            "closed_bars_compared_with_trade_ticks": compared_tick_bars,
+            "closed_bars_with_tick_mismatch": len(tick_bar_mismatches),
+            "first_tick_bar_mismatches": tick_bar_mismatches[:20],
         },
         "ticks": {
             "count": tick_count,
