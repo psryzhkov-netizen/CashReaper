@@ -161,6 +161,9 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Use MACD filter", Description = "MACD filters new entries only: long when difference > 0, short when difference < 0. An opposite body engulfing always closes the current position, even when MACD disagrees.", Order = 201)]
         public bool UseMacdFilter { get; set; } = true;
 
+        [Display(GroupName = "07. Signal", Name = "Minimum MACD difference from zero", Description = "0 disables this additional filter. Long requires MACD difference strictly above this value; Short requires it strictly below its negative value. Applies to new and reversal entries.", Order = 235)]
+        public decimal MinimumMacdDifferenceAbs { get; set; } = 0m;
+
         [Display(GroupName = "07. Signal", Name = "One entry per MACD difference crossing", Description = "Allow at most one filled long after difference crosses from negative to positive, and one filled short after it crosses from positive to negative. A new crossing rearms that direction.", Order = 204)]
         public bool OneEntryPerMacdCrossing { get; set; } = true;
 
@@ -407,7 +410,7 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; delta_rule=directional_strictly_greater; " +
+                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; delta_rule=directional_strictly_greater; " +
                 $"breakeven={BreakEvenEnabled}/{BreakEvenTriggerPoints}/{BreakEvenOffsetPoints}; trailing={TrailingMode}/{TrailingDistancePoints}; " +
                 $"reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
         }
@@ -914,8 +917,8 @@ namespace CashReaper
                 previousBullish &&
                 engulf;
 
-            var isLong = bullishEngulfing && ((!UseMacdFilter && !OneEntryPerMacdCrossing) || diff > 0);
-            var isShort = bearishEngulfing && ((!UseMacdFilter && !OneEntryPerMacdCrossing) || diff < 0);
+            var isLong = bullishEngulfing && PassesMacdEntryFilter(OrderDirections.Buy, diff);
+            var isShort = bearishEngulfing && PassesMacdEntryFilter(OrderDirections.Sell, diff);
 
             var activePosition = GetActivePosition();
 
@@ -1008,6 +1011,13 @@ namespace CashReaper
         private void ProcessSignal(OrderDirections direction, string signalName, int bar, decimal diff,
             bool filtersChecked = false)
         {
+            if (!PassesMacdEntryFilter(direction, diff))
+            {
+                RecordTradeEvent("entry_blocked_macd", bar, direction.ToString(), false,
+                    $"difference={diff}; minimum_abs_difference={MinimumMacdDifferenceAbs}", 0m);
+                return;
+            }
+
             if (!CanEnterMacdCycle(direction, bar))
             {
                 RecordTradeEvent("entry_blocked", bar, direction.ToString(), false,
@@ -1122,12 +1132,10 @@ namespace CashReaper
             FinalizeMacdThrough(signalBar);
             UpdateMacdCrossingState(signalBar);
 
-            if (UseMacdFilter && (direction == OrderDirections.Buy
-                    ? _difference[signalBar] <= 0
-                    : _difference[signalBar] >= 0))
+            if (!PassesMacdEntryFilter(direction, _difference[signalBar]))
             {
                 RecordTradeEvent("reversal_entry_blocked", signalBar, direction.ToString(), false,
-                    $"macd_direction_filter; difference={_difference[signalBar]}; position_closed=1", 0m);
+                    $"macd_direction_or_distance_filter; difference={_difference[signalBar]}; minimum_abs_difference={MinimumMacdDifferenceAbs}; position_closed=1", 0m);
                 return;
             }
 
@@ -2046,6 +2054,14 @@ namespace CashReaper
             if (UseMacdFilter && currentBearish && previousBullish && diff >= 0)
                 return "short_macd_filter";
 
+            if (MinimumMacdDifferenceAbs > 0m && currentBullish && previousBearish &&
+                diff <= MinimumMacdDifferenceAbs)
+                return "long_macd_distance_filter";
+
+            if (MinimumMacdDifferenceAbs > 0m && currentBearish && previousBullish &&
+                diff >= -MinimumMacdDifferenceAbs)
+                return "short_macd_distance_filter";
+
             if (!currentBullish && !currentBearish)
                 return "doji_current";
 
@@ -2053,6 +2069,20 @@ namespace CashReaper
                 return "doji_previous";
 
             return "bar_direction_filter";
+        }
+
+        private bool PassesMacdEntryFilter(OrderDirections direction, decimal difference)
+        {
+            if ((UseMacdFilter || OneEntryPerMacdCrossing) &&
+                (direction == OrderDirections.Buy ? difference <= 0m : difference >= 0m))
+                return false;
+
+            if (MinimumMacdDifferenceAbs <= 0m)
+                return true;
+
+            return direction == OrderDirections.Buy
+                ? difference > MinimumMacdDifferenceAbs
+                : difference < -MinimumMacdDifferenceAbs;
         }
 
         // Export every completed chart bar, including bars skipped by trading-state checks.
