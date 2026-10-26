@@ -64,6 +64,7 @@ def audit(root: Path, instance: str) -> dict:
     bar_files = chunks(root, "CashReaperBars-full", instance)
     footprint_files = chunks(root, "CashReaperFootprint-imbalance", instance)
     tick_files = chunks(root, "CashReaperTicks", instance)
+    market_files = chunks(root, "CashReaperMarketEvents", instance)
     issues = []
     if not stats_files:
         issues.append("no_statistics_chunks")
@@ -202,6 +203,19 @@ def audit(root: Path, instance: str) -> dict:
     if tick_sequence_gaps:
         issues.append("tick_sequence_gaps")
 
+    market_event_counts = Counter()
+    market_sequence_gaps = 0
+    previous_market_sequence = None
+    for row in read_rows(market_files):
+        market_event_counts[row.get("kind", "")] += 1
+        sequence = row.get("sequence", "")
+        if previous_market_sequence is not None and sequence.isdigit() and int(sequence) != previous_market_sequence + 1:
+            market_sequence_gaps += 1
+        if sequence.isdigit():
+            previous_market_sequence = int(sequence)
+    if market_sequence_gaps:
+        issues.append("market_event_sequence_gaps")
+
     pnl = sum((number(row.get("last_trade_pnl_points", "")) or Decimal(0) for row in closes), Decimal(0))
     final_pnl = number(closes[-1].get("total_pnl_points", "")) if closes else None
     if final_pnl is not None and pnl != final_pnl:
@@ -221,6 +235,16 @@ def audit(root: Path, instance: str) -> dict:
             "bars": audit_stream_ranges(bar_files),
             "footprints": audit_stream_ranges(footprint_files),
             "ticks": audit_stream_ranges(tick_files),
+            "market_events": audit_stream_ranges(market_files),
+        },
+        "market_events": {
+            "counts_by_kind": dict(market_event_counts),
+            "sequence_gaps": market_sequence_gaps,
+            "has_trade_prints": market_event_counts["trade"] > 0,
+            "has_level2_updates": market_event_counts["depth"] > 0,
+            "has_initial_depth_snapshot": market_event_counts["snapshot_begin"] > 0
+                and market_event_counts["snapshot"] > 0
+                and market_event_counts["snapshot_end"] > 0,
         },
         "ticks": {
             "count": tick_count,

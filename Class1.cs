@@ -74,6 +74,9 @@ namespace CashReaper
         [Display(GroupName = "02. Replay and diagnostics", Name = "Collect replay ticks", Description = "Record each OnNewTrade print for offline replay. Enable only for a diagnostic Market Replay; this can create a large CSV file.", Order = 32)]
         public bool TickCollectorEnabled { get; set; } = false;
 
+        [Display(GroupName = "02. Replay and diagnostics", Name = "Collect Level 2 updates", Description = "Record the initial order-book snapshot and subsequent MarketDepthChanged updates in the same ordered market-event log as trades. Use only for a short diagnostic replay first.", Order = 33)]
+        public bool DepthCollectorEnabled { get; set; } = false;
+
         [Display(GroupName = "02. Replay and diagnostics", Name = "Debug notifications", Order = 40)]
         public bool DebugMode { get; set; } = true;
 
@@ -337,8 +340,8 @@ namespace CashReaper
         private decimal _lastKnownPosition;
         private decimal _trackedPosition;
         private int _lossSeriesStep;
-        private readonly List<string> _tickBuffer = new List<string>(512);
-        private long _tickSequence;
+        private readonly List<string> _marketEventBuffer = new List<string>(512);
+        private long _marketEventSequence;
 
         public CashReaperStrategy() : base(true)
         {
@@ -347,6 +350,9 @@ namespace CashReaper
 
         protected override void OnStarted()
         {
+            if (DepthCollectorEnabled)
+                CaptureDepthSnapshot();
+
             _lastFinalizedMacdBar = -1;
             _finalizedFastPeriod = -1;
             _finalizedSlowPeriod = -1;
@@ -408,7 +414,7 @@ namespace CashReaper
 
         protected override void OnStopping()
         {
-            FlushTickBuffer();
+            FlushMarketEventBuffer();
             _reversalPending = false;
             CancelProtectiveOrders();
 
@@ -428,57 +434,89 @@ namespace CashReaper
 
         protected override void OnNewTrade(MarketDataArg arg)
         {
-            if (TickCollectorEnabled && arg != null && arg.DataType.ToString() == "Trade")
-            {
-                lock (_tickBuffer)
-                {
-                    _tickBuffer.Add(string.Join(",",
-                        Csv(GetInstanceLabel()),
-                        Csv(Security == null ? "" : Security.ToString()),
-                        Csv(++_tickSequence),
-                        Csv(arg.Time.ToString("O", CultureInfo.InvariantCulture)),
-                        Csv(arg.Price), Csv(arg.Volume), Csv(arg.Direction),
-                        Csv(Math.Max(0, CurrentBar - 1))));
-
-                    if (_tickBuffer.Count >= 512)
-                        FlushTickBufferLocked();
-                }
-            }
+            if (TickCollectorEnabled && arg != null)
+                RecordMarketEvent("trade", arg);
 
             base.OnNewTrade(arg);
         }
 
-        private void FlushTickBuffer()
+        protected override void MarketDepthChanged(MarketDataArg arg)
         {
-            lock (_tickBuffer)
-                FlushTickBufferLocked();
+            if (DepthCollectorEnabled && arg != null)
+                RecordMarketEvent("depth", arg);
+
+            base.MarketDepthChanged(arg);
         }
 
-        private void FlushTickBufferLocked()
+        private void CaptureDepthSnapshot()
         {
-            if (_tickBuffer.Count == 0)
+            try
+            {
+                RecordMarketEvent("snapshot_begin", null);
+                foreach (var level in MarketDepthInfo.GetMarketDepthSnapshot())
+                {
+                    if (level != null)
+                        RecordMarketEvent("snapshot", level);
+                }
+                RecordMarketEvent("snapshot_end", null);
+            }
+            catch (Exception ex)
+            {
+                RaiseDebug($"Level 2 snapshot error: {ex.Message}");
+            }
+        }
+
+        private void RecordMarketEvent(string kind, MarketDataArg arg)
+        {
+            lock (_marketEventBuffer)
+            {
+                _marketEventBuffer.Add(string.Join(",",
+                    Csv(GetInstanceLabel()),
+                    Csv(Security == null ? "" : Security.ToString()),
+                    Csv(++_marketEventSequence), Csv(kind),
+                    Csv(arg == null ? "" : arg.Time.ToString("O", CultureInfo.InvariantCulture)),
+                    Csv(arg == null ? 0m : arg.Price),
+                    Csv(arg == null ? 0m : arg.Volume),
+                    Csv(arg == null ? "" : arg.Direction.ToString()),
+                    Csv(arg == null ? "" : arg.DataType.ToString()),
+                    Csv(Math.Max(0, CurrentBar - 1))));
+
+                if (_marketEventBuffer.Count >= 512)
+                    FlushMarketEventBufferLocked();
+            }
+        }
+
+        private void FlushMarketEventBuffer()
+        {
+            lock (_marketEventBuffer)
+                FlushMarketEventBufferLocked();
+        }
+
+        private void FlushMarketEventBufferLocked()
+        {
+            if (_marketEventBuffer.Count == 0)
                 return;
 
             try
             {
-                var path = Path.Combine(Path.GetDirectoryName(GetStatisticsPath()), "CashReaperTicks-v1.csv");
+                var path = Path.Combine(Path.GetDirectoryName(GetStatisticsPath()), "CashReaperMarketEvents-v1.csv");
                 lock (StatsFileLock)
                 {
                     var fileExists = File.Exists(path);
                     using (var writer = new StreamWriter(path, append: true))
                     {
                         if (!fileExists)
-                            writer.WriteLine("instance,instrument,sequence,time,price,volume,direction,chart_bar");
-                        foreach (var line in _tickBuffer)
+                            writer.WriteLine("instance,instrument,sequence,kind,time,price,volume,direction,data_type,chart_bar");
+                        foreach (var line in _marketEventBuffer)
                             writer.WriteLine(line);
                     }
                 }
 
-                _tickBuffer.Clear();
+                _marketEventBuffer.Clear();
             }
             catch (Exception ex)
             {
-                RaiseDebug($"Tick collector error: {ex.Message}");
+                RaiseDebug($"Market event collector error: {ex.Message}");
             }
         }
 
