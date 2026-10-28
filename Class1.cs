@@ -92,16 +92,22 @@ namespace CashReaper
         [Display(GroupName = "04. Time filter", Name = "Use trading pause", Order = 80)]
         public bool TradingTimeLimitEnabled { get; set; } = false;
 
-        [Display(GroupName = "04. Time filter", Name = "Trade on Saturday", Description = "Allow new entries on Saturday in chart time. Existing positions remain protected.", Order = 81)]
+        [Display(GroupName = "04. Time filter", Name = "Trade on Saturday", Description = "Allow new entries on Saturday in robot time. Existing positions remain protected.", Order = 81)]
         public bool TradeOnSaturday { get; set; } = false;
 
-        [Display(GroupName = "04. Time filter", Name = "Trade on Sunday", Description = "Allow new entries on Sunday in chart time. Existing positions remain protected.", Order = 82)]
+        [Display(GroupName = "04. Time filter", Name = "Trade on Sunday", Description = "Allow new entries on Sunday in robot time. Existing positions remain protected.", Order = 82)]
         public bool TradeOnSunday { get; set; } = false;
+
+        [Display(GroupName = "04. Time filter", Name = "Robot time GMT offset", Description = "Time zone used for trading pause, weekdays and daily limits. GMT+3 is Moscow time.", Order = 83)]
+        public decimal RobotTimeGmtOffsetHours { get; set; } = 3m;
+
+        [Display(GroupName = "04. Time filter", Name = "ATAS chart GMT offset", Description = "GMT offset of candle times supplied by ATAS. Use GMT+0 for UTC candle times; set GMT+3 if the chart already uses Moscow time.", Order = 84)]
+        public decimal ChartTimeGmtOffsetHours { get; set; } = 0m;
 
         [Display(GroupName = "05. Risk sizing", Name = "Calculate volume from risk", Description = "With TP/SL enabled, volume = reference balance x risk percentage / (stop distance x point value). Without a stop order, Base volume is used instead.", Order = 120)]
         public bool RiskSizingEnabled { get; set; } = false;
 
-        [Display(GroupName = "05a. Daily profit limit", Name = "Enable profit limit", Description = "Stop new entries until the next chart day and close this strategy's position when the selected daily profit target is reached.", Order = 121)]
+        [Display(GroupName = "05a. Daily profit limit", Name = "Enable profit limit", Description = "Stop new entries until the next day in robot time and close this strategy's position when the selected daily profit target is reached.", Order = 121)]
         public bool AccountProfitTargetEnabled { get; set; } = false;
 
         [Display(GroupName = "05a. Daily profit limit", Name = "Calculate profit in", Description = "Account currency: ATAS ClosedPnL + OpenPnL for the selected account. Points: sum of this strategy's closed and open price movements today, without volume or commissions.", Order = 122)]
@@ -113,7 +119,7 @@ namespace CashReaper
         [Display(GroupName = "05a. Daily profit limit", Name = "Profit target: points", Description = "Used only when Calculate profit in is Points. Closed trades today plus the open position's price movement; without volume or commissions. Enter a positive number.", Order = 1222)]
         public decimal DailyProfitTargetPoints { get; set; } = 2m;
 
-        [Display(GroupName = "05b. Daily loss limit", Name = "Enable loss limit", Description = "Stop new entries until the next chart day and close this strategy's position when the selected daily loss limit is reached.", Order = 123)]
+        [Display(GroupName = "05b. Daily loss limit", Name = "Enable loss limit", Description = "Stop new entries until the next day in robot time and close this strategy's position when the selected daily loss limit is reached.", Order = 123)]
         public bool AccountLossLimitEnabled { get; set; } = false;
 
         [Display(GroupName = "05b. Daily loss limit", Name = "Calculate loss in", Description = "Account currency: ATAS ClosedPnL + OpenPnL for the selected account. Points: sum of this strategy's closed and open price movements today, without volume or commissions.", Order = 124)]
@@ -410,7 +416,7 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; delta_rule=directional_strictly_greater; " +
+                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; delta_rule=directional_strictly_greater; chart_gmt_offset={ChartTimeGmtOffsetHours}; robot_gmt_offset={RobotTimeGmtOffsetHours}; " +
                 $"breakeven={BreakEvenEnabled}/{BreakEvenTriggerPoints}/{BreakEvenOffsetPoints}; trailing={TrailingMode}/{TrailingDistancePoints}; " +
                 $"reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
         }
@@ -555,7 +561,7 @@ namespace CashReaper
             if (bar != lastBar)
                 return;
 
-            UpdateDailyPointSession(GetTerminalTime(lastBar).Date, candle.Close, GetActivePosition());
+            UpdateDailyPointSession(GetRobotTime(lastBar).Date, candle.Close, GetActivePosition());
             // Account OpenPnL changes on every price update, not only once per bar.
             CheckAccountLimits(bar);
 
@@ -649,7 +655,7 @@ namespace CashReaper
 
             var previousPosition = GetActivePosition();
             var tradeBar = Math.Max(0, CurrentBar - 1);
-            UpdateDailyPointSession(GetTerminalTime(tradeBar).Date, GetCandle(tradeBar).Close, previousPosition);
+            UpdateDailyPointSession(GetRobotTime(tradeBar).Date, GetCandle(tradeBar).Close, previousPosition);
             ApplyMyTradeToTrackedPosition(myTrade);
             var activePosition = GetActivePosition();
 
@@ -2512,7 +2518,7 @@ namespace CashReaper
                         Csv(""),
                         Csv(""),
                         Csv(directionalImbalance.HasValue ? directionalImbalance.Value.ToString(CultureInfo.InvariantCulture) : ""),
-                        Csv(CurrentBar > 0 ? GetTerminalTime(CurrentBar - 1).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : ""),
+                        Csv(CurrentBar > 0 ? GetRobotTime(CurrentBar - 1).ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : ""),
                         Csv(Portfolio == null ? "" : Portfolio.Currency.ToString()),
                         Csv(Portfolio == null ? 0m : Portfolio.ClosedPnL),
                         Csv(Portfolio == null ? 0m : Portfolio.OpenPnL),
@@ -2582,7 +2588,7 @@ namespace CashReaper
 
         private bool IsWeekendTradingAllowed(int bar)
         {
-            var day = GetTerminalTime(bar).DayOfWeek;
+            var day = GetRobotTime(bar).DayOfWeek;
             return (day != DayOfWeek.Saturday || TradeOnSaturday) &&
                    (day != DayOfWeek.Sunday || TradeOnSunday);
         }
@@ -2604,7 +2610,7 @@ namespace CashReaper
                 return true;
             }
 
-            var chartDate = GetTerminalTime(CurrentBar - 1).Date;
+            var chartDate = GetRobotTime(CurrentBar - 1).Date;
             var marketPrice = GetCandle(CurrentBar - 1).Close;
             UpdateDailyPointSession(chartDate, marketPrice, GetActivePosition());
             if (_accountStopBlockedDate == chartDate)
@@ -2809,7 +2815,7 @@ namespace CashReaper
             if (!TradingTimeLimitEnabled)
                 return true;
 
-            var terminalTime = GetTerminalTime(bar);
+            var terminalTime = GetRobotTime(bar);
             var start = new TimeSpan(
                 Clamp(TradingPauseStartHour, 0, 23),
                 Clamp(TradingPauseStartMinute, 0, 59),
@@ -2831,22 +2837,26 @@ namespace CashReaper
                 _lastTimeLimitNoticeDate = terminalTime.Date;
 
                 RaiseShowNotification(
-                    $"{GetInstanceLabel()}: включена пауза торговли. TerminalTime={terminalTime:HH:mm}; Pause={GetPausePeriodText()}. Новые входы запрещены.");
+                    $"{GetInstanceLabel()}: включена пауза торговли. RobotTime={terminalTime:HH:mm}; Pause={GetPausePeriodText()}. Новые входы запрещены.");
             }
 
             return false;
         }
 
-        private DateTime GetTerminalTime(int bar)
+        private DateTime GetRobotTime(int bar)
         {
+            var robotOffset = Math.Clamp(RobotTimeGmtOffsetHours, -12m, 14m);
+            var chartOffset = Math.Clamp(ChartTimeGmtOffsetHours, -12m, 14m);
             try
             {
                 dynamic candle = GetCandle(bar);
-                return candle.Time;
+                var chartTime = (DateTime)candle.Time;
+                return DateTime.SpecifyKind(chartTime, DateTimeKind.Unspecified)
+                    .AddMinutes((double)((robotOffset - chartOffset) * 60m));
             }
             catch
             {
-                return DateTime.Now;
+                return DateTime.UtcNow.AddMinutes((double)(robotOffset * 60m));
             }
         }
 
