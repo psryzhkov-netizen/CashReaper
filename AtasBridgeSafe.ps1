@@ -10,9 +10,9 @@ $dataDir = Join-Path $env:APPDATA 'CashReaper'
 $secretPath = Join-Path $dataDir 'AtasBridge.secret'
 $statePath = Join-Path $dataDir 'AtasBridge.state.json'
 $logPath = Join-Path $dataDir 'AtasBridge.log'
-$maxChunkBytes = 256 * 1024
+$maxChunkBytes = 3 * 1024 * 1024
 $maxUploadsPerRun = if ($IncludeHighVolume) { 4 } else { 2 }
-$maxBytesPerDay = 8 * 1024 * 1024
+$maxBytesPerDay = 750 * 1024 * 1024
 $maxBacklogBytes = 16 * 1024 * 1024
 $tailBytesOnBacklog = 2 * 1024 * 1024
 
@@ -110,7 +110,10 @@ try {
             [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         try {
             if ($stream.Length -lt [long]$entry.offset) { $entry.offset = 0L }
-            if (-not $CatchUp -and $stream.Length - [long]$entry.offset -gt $maxBacklogBytes) {
+            # Never discard gaps in the default stats/bars streams. Historical
+            # tick/footprint streams still skip a large backlog unless -CatchUp.
+            $isCoreStream = $file.Name -match '^CashReaper(Stats|Bars)-'
+            if (-not $isCoreStream -and -not $CatchUp -and $stream.Length - [long]$entry.offset -gt $maxBacklogBytes) {
                 $oldOffset = [long]$entry.offset
                 $stream.Position = [Math]::Max(0L, $stream.Length - $tailBytesOnBacklog)
                 if ($stream.Position -gt 0) {
