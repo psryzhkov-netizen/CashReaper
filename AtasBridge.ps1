@@ -1,4 +1,4 @@
-param([switch]$Install)
+param([switch]$Install, [switch]$IncludeHighVolume, [switch]$CatchUp)
 
 # Read-only CashReaper -> Shtab bridge. Run once with -Install under the same
 # Windows account that runs ATAS. No trading API credentials are used.
@@ -10,7 +10,11 @@ $dataDir = Join-Path $env:APPDATA 'CashReaper'
 $secretPath = Join-Path $dataDir 'AtasBridge.secret'
 $statePath = Join-Path $dataDir 'AtasBridge.state.json'
 $logPath = Join-Path $dataDir 'AtasBridge.log'
-$maxChunkBytes = 4 * 1024 * 1024
+$maxChunkBytes = 256 * 1024
+$maxUploadsPerRun = if ($IncludeHighVolume) { 4 } else { 2 }
+$maxBytesPerDay = 8 * 1024 * 1024
+$maxBacklogBytes = 16 * 1024 * 1024
+$tailBytesOnBacklog = 2 * 1024 * 1024
 
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 
@@ -75,10 +79,27 @@ try {
         [pscustomobject]@{ files = @() }
     }
     if ($null -eq $state.files) { $state.files = @() }
+    if ($null -eq $state.PSObject.Properties['day']) {
+        $state | Add-Member -NotePropertyName day -NotePropertyValue ''
+    }
+    if ($null -eq $state.PSObject.Properties['uploadedTodayBytes']) {
+        $state | Add-Member -NotePropertyName uploadedTodayBytes -NotePropertyValue 0L
+    }
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+    if ($state.day -ne $today) {
+        $state.day = $today
+        $state.uploadedTodayBytes = 0L
+    }
+    $uploadsThisRun = 0
 
-    $files = Get-ChildItem -LiteralPath $dataDir -Filter 'CashReaper*-v1.csv' -File
+    # Summary and closed bars first. Tick/depth and footprint streams are opt-in.
+    $files = Get-ChildItem -LiteralPath $dataDir -Filter 'CashReaper*-v1.csv' -File |
+        Where-Object { $IncludeHighVolume -or $_.Name -match '^CashReaper(Stats|Bars)-' } |
+        Sort-Object @{ Expression = { if ($_.Name -match '^CashReaperStats-') { 0 } else { 1 } } }, Name
 
     foreach ($file in $files) {
+        if ($uploadsThisRun -ge $maxUploadsPerRun -or
+            [long]$state.uploadedTodayBytes -ge $maxBytesPerDay) { break }
         $entry = @($state.files | Where-Object { $_.path -eq $file.FullName }) | Select-Object -First 1
         if ($null -eq $entry) {
             $entry = [pscustomobject]@{ path = $file.FullName; offset = 0L }
@@ -89,16 +110,29 @@ try {
             [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         try {
             if ($stream.Length -lt [long]$entry.offset) { $entry.offset = 0L }
+            if (-not $CatchUp -and $stream.Length - [long]$entry.offset -gt $maxBacklogBytes) {
+                $oldOffset = [long]$entry.offset
+                $stream.Position = [Math]::Max(0L, $stream.Length - $tailBytesOnBacklog)
+                if ($stream.Position -gt 0) {
+                    while ($stream.Position -lt $stream.Length -and $stream.ReadByte() -ne 10) { }
+                }
+                $entry.offset = $stream.Position
+                Write-BridgeLog ('Большой архив {0}: пропущены байты {1}-{2}; данные остались локально. Для отправки архива вручную используйте -CatchUp.' -f $file.Name, $oldOffset, $entry.offset)
+            }
+            $stream.Position = 0
             $headerBytes = New-Object byte[] 8192
             $headerCount = $stream.Read($headerBytes, 0, $headerBytes.Length)
             $headerEnd = [Array]::IndexOf($headerBytes, [byte]10, 0, $headerCount)
             if ($headerEnd -lt 0) { continue }
             $headerLength = $headerEnd + 1
 
-            while ($stream.Length -gt [long]$entry.offset) {
+            while ($stream.Length -gt [long]$entry.offset -and
+                   $uploadsThisRun -lt $maxUploadsPerRun -and
+                   [long]$state.uploadedTodayBytes -lt $maxBytesPerDay) {
                 $offset = [long]$entry.offset
                 $stream.Position = $offset
-                $buffer = New-Object byte[] $maxChunkBytes
+                $budget = [Math]::Min($maxChunkBytes, $maxBytesPerDay - [long]$state.uploadedTodayBytes)
+                $buffer = New-Object byte[] ([int]$budget)
                 $count = $stream.Read($buffer, 0, $buffer.Length)
                 if ($count -eq 0) { break }
 
@@ -135,15 +169,24 @@ try {
                 }
 
                 $entry.offset = $endOffset
+                $state.uploadedTodayBytes = [long]$state.uploadedTodayBytes + $payload.Length
+                $uploadsThisRun++
                 $nextStatePath = $statePath + '.next'
                 $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $nextStatePath -Encoding UTF8
                 Move-Item -LiteralPath $nextStatePath -Destination $statePath -Force
                 Write-BridgeLog ('Отправлено {0}: байты {1}-{2}' -f $file.Name, $offset, $endOffset)
+                # Give the next file a turn; otherwise a busy stats stream starves bars.
+                break
             }
         } finally {
             $stream.Dispose()
         }
     }
+
+    # Persist skipped-backlog offsets even if no complete new CSV line was uploaded.
+    $nextStatePath = $statePath + '.next'
+    $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $nextStatePath -Encoding UTF8
+    Move-Item -LiteralPath $nextStatePath -Destination $statePath -Force
 } catch {
     Write-BridgeLog ('ОШИБКА: ' + $_.Exception.Message)
     throw

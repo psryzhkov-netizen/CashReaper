@@ -92,6 +92,27 @@ namespace CashReaper
         [Display(GroupName = "04. Time filter", Name = "Use trading pause", Order = 80)]
         public bool TradingTimeLimitEnabled { get; set; } = false;
 
+        [Display(GroupName = "04. Time filter", Name = "Close before trading pause", Description = "One minute before Pause start, cancel entries, close this strategy's position and block entries until Pause end. Requires Use trading pause.", Order = 85)]
+        public bool CloseBeforeTradingPause { get; set; } = false;
+
+        [Display(GroupName = "04. Time filter", Name = "Use session hours", Description = "Use the exchange session times entered below in robot time. ATAS chart candles do not provide a reliable exchange-session close schedule.", Order = 86)]
+        public bool UseSessionHours { get; set; } = false;
+
+        [Display(GroupName = "04. Time filter", Name = "Session open hour", Order = 87)]
+        public int SessionOpenHour { get; set; } = 0;
+
+        [Display(GroupName = "04. Time filter", Name = "Session open minute", Order = 88)]
+        public int SessionOpenMinute { get; set; } = 0;
+
+        [Display(GroupName = "04. Time filter", Name = "Session close hour", Order = 89)]
+        public int SessionCloseHour { get; set; } = 23;
+
+        [Display(GroupName = "04. Time filter", Name = "Session close minute", Order = 89)]
+        public int SessionCloseMinute { get; set; } = 59;
+
+        [Display(GroupName = "04. Time filter", Name = "Close before session end", Description = "One minute before Session close, cancel entries, flatten this strategy's position and block entries until Session open. Requires Use session hours.", Order = 89)]
+        public bool CloseBeforeSessionEnd { get; set; } = false;
+
         [Display(GroupName = "04. Time filter", Name = "Trade on Saturday", Description = "Allow new entries on Saturday in robot time. Existing positions remain protected.", Order = 81)]
         public bool TradeOnSaturday { get; set; } = false;
 
@@ -179,11 +200,17 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Minimum imbalance %", Description = "Long: maximum Ask/Bid imbalance; Short: maximum Bid/Ask imbalance on the signal bar.", Order = 203)]
         public decimal MinimumImbalancePercent { get; set; } = 10000m;
 
-        [Display(GroupName = "07. Signal", Name = "Use Delta filter", Description = "Require directional Delta strictly above the threshold on the closed signal bar. If bar volume is unavailable, skip the entry.", Order = 205)]
+        [Display(GroupName = "07. Signal", Name = "Use Delta % filter", Description = "Require directional Delta as a percent of bar volume strictly above the threshold. If bar volume is unavailable, skip the entry.", Order = 205)]
         public bool UseDeltaFilter { get; set; } = false;
 
         [Display(GroupName = "07. Signal", Name = "Minimum directional Delta %", Description = "100 * Delta / Volume for long; -100 * Delta / Volume for short. Entry requires a value strictly greater than this threshold.", Order = 206)]
         public decimal MinimumDirectionalDeltaPercent { get; set; } = 50m;
+
+        [Display(GroupName = "07. Signal", Name = "Use absolute Delta filter", Description = "Require raw Delta on the closed signal bar to exceed the threshold for long, or fall below its negative for short. Independent of Delta % filter.", Order = 207)]
+        public bool UseAbsoluteDeltaFilter { get; set; } = false;
+
+        [Display(GroupName = "07. Signal", Name = "Minimum absolute directional Delta", Description = "Raw contracts/volume units, not percent. Zero requires positive Delta for long and negative Delta for short. Entry requires strictly greater magnitude.", Order = 208)]
+        public decimal MinimumAbsoluteDirectionalDelta { get; set; } = 0m;
 
         [Display(GroupName = "08. TP/SL", Name = "TP/SL mode", Order = 250)]
         public ProtectionMode ProtectionCalculationMode { get; set; } = ProtectionMode.Points;
@@ -328,6 +355,9 @@ namespace CashReaper
         private bool _protectivePlacementStarted;
         private bool _closingTrade;
         private bool _tradingStoppedByTime;
+        private bool _scheduleClosing;
+        private string _scheduleCloseReason = "";
+        private DateTime _latestScheduleTime = DateTime.MinValue;
         private bool _accountLimitInvalidNotified;
         private bool _accountStopClosing;
         private AccountStopReason _accountStopReason;
@@ -351,6 +381,8 @@ namespace CashReaper
         private int _lossSeriesStep;
         private readonly List<string> _marketEventBuffer = new List<string>(512);
         private long _marketEventSequence;
+        private bool _marketEventCollectorFailed;
+        private bool _footprintCollectorLimitNotified;
 
         public CashReaperStrategy() : base(true)
         {
@@ -377,6 +409,7 @@ namespace CashReaper
             _trackedPosition = CurrentPosition;
             _moneyEstimatePosition = CurrentPosition;
             _lastKnownPosition = GetActivePosition();
+            _latestScheduleTime = DateTime.MinValue;
 
             if (SkipOldSignalOnStart)
                 _lastProcessedSignalBar = Math.Max(_lastProcessedSignalBar, CurrentBar - 2);
@@ -416,9 +449,12 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; delta_rule=directional_strictly_greater; chart_gmt_offset={ChartTimeGmtOffsetHours}; robot_gmt_offset={RobotTimeGmtOffsetHours}; " +
+                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; absolute_delta_filter={UseAbsoluteDeltaFilter}; absolute_delta_threshold={MinimumAbsoluteDirectionalDelta}; delta_rule=directional_strictly_greater; session_hours={UseSessionHours}/{SessionOpenHour}:{SessionOpenMinute}-{SessionCloseHour}:{SessionCloseMinute}; flatten_session={CloseBeforeSessionEnd}; flatten_pause={CloseBeforeTradingPause}; chart_gmt_offset={ChartTimeGmtOffsetHours}; robot_gmt_offset={RobotTimeGmtOffsetHours}; " +
                 $"breakeven={BreakEvenEnabled}/{BreakEvenTriggerPoints}/{BreakEvenOffsetPoints}; trailing={TrailingMode}/{TrailingDistancePoints}; " +
                 $"reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
+
+            if (CurrentBar > 0)
+                EnforceSchedule(GetRobotTimeFromChartTime(GetCandle(CurrentBar - 1).LastTime));
         }
 
         protected override void OnStopping()
@@ -443,6 +479,8 @@ namespace CashReaper
 
         protected override void OnNewTrade(MarketDataArg arg)
         {
+            EnforceScheduleFromMarketEvent(arg);
+
             if (TickCollectorEnabled && arg != null)
                 RecordMarketEvent("trade", arg);
 
@@ -451,6 +489,8 @@ namespace CashReaper
 
         protected override void MarketDepthChanged(MarketDataArg arg)
         {
+            EnforceScheduleFromMarketEvent(arg);
+
             if (DepthCollectorEnabled && arg != null)
                 RecordMarketEvent("depth", arg);
 
@@ -477,21 +517,33 @@ namespace CashReaper
 
         private void RecordMarketEvent(string kind, MarketDataArg arg)
         {
+            if (_marketEventCollectorFailed)
+                return;
+
             lock (_marketEventBuffer)
             {
-                _marketEventBuffer.Add(string.Join(",",
-                    Csv(GetInstanceLabel()),
-                    Csv(Security == null ? "" : Security.ToString()),
-                    Csv(++_marketEventSequence), Csv(kind),
-                    Csv(arg == null ? "" : arg.Time.ToString("O", CultureInfo.InvariantCulture)),
-                    Csv(arg == null ? 0m : arg.Price),
-                    Csv(arg == null ? 0m : arg.Volume),
-                    Csv(arg == null ? "" : arg.Direction.ToString()),
-                    Csv(arg == null ? "" : arg.DataType.ToString()),
-                    Csv(Math.Max(0, CurrentBar - 1))));
+                try
+                {
+                    _marketEventBuffer.Add(string.Join(",",
+                        Csv(GetInstanceLabel()),
+                        Csv(Security == null ? "" : Security.ToString()),
+                        Csv(++_marketEventSequence), Csv(kind),
+                        Csv(arg == null ? "" : arg.Time.ToString("O", CultureInfo.InvariantCulture)),
+                        Csv(arg == null ? 0m : arg.Price),
+                        Csv(arg == null ? 0m : arg.Volume),
+                        Csv(arg == null ? "" : arg.Direction.ToString()),
+                        Csv(arg == null ? "" : arg.DataType.ToString()),
+                        Csv(Math.Max(0, CurrentBar - 1))));
 
-                if (_marketEventBuffer.Count >= 512)
-                    FlushMarketEventBufferLocked();
+                    if (_marketEventBuffer.Count >= 512)
+                        FlushMarketEventBufferLocked();
+                }
+                catch (Exception ex)
+                {
+                    _marketEventCollectorFailed = true;
+                    _marketEventBuffer.Clear();
+                    RaiseShowNotification($"{GetInstanceLabel()}: запись тиков/стакана остановлена из-за ошибки: {ex.Message}. Остальная статистика собирается.");
+                }
             }
         }
 
@@ -512,6 +564,13 @@ namespace CashReaper
                 lock (StatsFileLock)
                 {
                     var fileExists = File.Exists(path);
+                    if (fileExists && new FileInfo(path).Length >= 256L * 1024L * 1024L)
+                    {
+                        _marketEventCollectorFailed = true;
+                        _marketEventBuffer.Clear();
+                        RaiseShowNotification($"{GetInstanceLabel()}: журнал тиков/стакана достиг 256 МБ; его запись остановлена. Остальная статистика собирается.");
+                        return;
+                    }
                     using (var writer = new StreamWriter(path, append: true))
                     {
                         if (!fileExists)
@@ -525,7 +584,9 @@ namespace CashReaper
             }
             catch (Exception ex)
             {
-                RaiseDebug($"Market event collector error: {ex.Message}");
+                _marketEventCollectorFailed = true;
+                _marketEventBuffer.Clear();
+                RaiseShowNotification($"{GetInstanceLabel()}: запись тиков/стакана остановлена из-за ошибки: {ex.Message}. Остальная статистика собирается.");
             }
         }
 
@@ -560,6 +621,8 @@ namespace CashReaper
 
             if (bar != lastBar)
                 return;
+
+            EnforceSchedule(GetRobotTimeFromChartTime(candle.LastTime));
 
             UpdateDailyPointSession(GetRobotTime(lastBar).Date, candle.Close, GetActivePosition());
             // Account OpenPnL changes on every price update, not only once per bar.
@@ -726,10 +789,20 @@ namespace CashReaper
 
                     if (_accountStopClosing)
                         RecordTradeClosed(GetAccountStopOutcome());
+                    else if (_scheduleClosing)
+                        RecordTradeClosed(_scheduleCloseReason);
 
                     ResetTradeState();
                 }
 
+                return;
+            }
+
+            // An entry may fill after its cancellation was requested at the boundary.
+            if (_scheduleClosing && activePosition != 0)
+            {
+                CancelProtectiveOrders();
+                EmergencyFlattenPosition(_scheduleCloseReason);
                 return;
             }
 
@@ -884,6 +957,12 @@ namespace CashReaper
         {
             UpdateMacdCrossingState(bar);
 
+            if (_scheduleClosing)
+            {
+                RecordBarDecision(bar, null, null, 0, false, "", false, _scheduleCloseReason);
+                return;
+            }
+
             if (_reversalPending)
             {
                 RecordBarDecision(bar, null, null, 0, false, "", false, "reversal_close_pending");
@@ -969,7 +1048,8 @@ namespace CashReaper
                     RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "macd_positive_cycle_unavailable");
                     return;
                 }
-                if (!PassesDeltaFilter(bar, OrderDirections.Buy))
+                if (!PassesDeltaFilter(bar, OrderDirections.Buy) ||
+                    !PassesAbsoluteDeltaFilter(bar, OrderDirections.Buy))
                 {
                     RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "delta_filter");
                     return;
@@ -991,7 +1071,8 @@ namespace CashReaper
                     RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", false, "macd_negative_cycle_unavailable");
                     return;
                 }
-                if (!PassesDeltaFilter(bar, OrderDirections.Sell))
+                if (!PassesDeltaFilter(bar, OrderDirections.Sell) ||
+                    !PassesAbsoluteDeltaFilter(bar, OrderDirections.Sell))
                 {
                     RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", false, "delta_filter");
                     return;
@@ -1033,7 +1114,8 @@ namespace CashReaper
 
             if (!filtersChecked)
             {
-                if (!PassesDeltaFilter(bar, direction) || !PassesImbalanceFilter(bar, direction))
+                if (!PassesDeltaFilter(bar, direction) || !PassesAbsoluteDeltaFilter(bar, direction) ||
+                    !PassesImbalanceFilter(bar, direction))
                     return;
             }
 
@@ -1153,6 +1235,7 @@ namespace CashReaper
             }
 
             if (accountLimitClosing || !TradingEnabled || UseProtectiveOrders ||
+                _scheduleClosing ||
                 _pendingCancelTakeProfitOrder != null ||
                 _pendingCancelStopLossOrder != null || !CheckAccountLimits(signalBar) ||
                 !IsWeekendTradingAllowed(CurrentBar - 1) || !IsTradingTimeAllowed(CurrentBar - 1))
@@ -1851,6 +1934,8 @@ namespace CashReaper
                     ? $"{GetInstanceLabel()}: противоположное поглощение. Закрываю текущую позицию {closeDirection}; Volume={Math.Abs(activePosition)}."
                     : reason == "account_profit_target" || reason == "account_loss_limit"
                     ? $"{GetInstanceLabel()}: дневной денежный лимит счёта достигнут. Отправлено досрочное закрытие {closeDirection}; Volume={Math.Abs(activePosition)}."
+                    : reason == "session_close" || reason == "trading_pause"
+                    ? $"{GetInstanceLabel()}: граница торгового времени. Отправлено закрытие {closeDirection}; Volume={Math.Abs(activePosition)}. Ожидаю подтверждения исполнения."
                     : $"{GetInstanceLabel()}: обнаружено исполнение без активной сделки стратегии. Отправляю аварийное закрытие {closeDirection}; Volume={Math.Abs(activePosition)}.");
             }
             catch (Exception ex)
@@ -2317,6 +2402,35 @@ namespace CashReaper
             return false;
         }
 
+        private bool PassesAbsoluteDeltaFilter(int bar, OrderDirections direction)
+        {
+            if (!UseAbsoluteDeltaFilter)
+                return true;
+
+            var status = "ok";
+            decimal delta = 0m;
+            try
+            {
+                if (bar < 0 || bar >= CurrentBar)
+                    status = "unavailable";
+                else
+                    delta = GetCandle(bar).Delta;
+            }
+            catch (Exception ex)
+            {
+                status = "read_error:" + ex.GetType().Name;
+            }
+
+            var directionalDelta = direction == OrderDirections.Buy ? delta : -delta;
+            if (status == "ok" && MinimumAbsoluteDirectionalDelta >= 0m &&
+                directionalDelta > MinimumAbsoluteDirectionalDelta)
+                return true;
+
+            RecordTradeEvent("entry_blocked_absolute_delta", bar, direction.ToString(), false,
+                $"status={status}; directional_delta={directionalDelta}; threshold={MinimumAbsoluteDirectionalDelta}", 0m);
+            return false;
+        }
+
         private bool PassesImbalanceFilter(int bar, OrderDirections direction)
         {
             if (!UseImbalanceFilter)
@@ -2394,6 +2508,15 @@ namespace CashReaper
                 lock (StatsFileLock)
                 {
                     var fileExists = File.Exists(path);
+                    if (fileExists && new FileInfo(path).Length >= 256L * 1024L * 1024L)
+                    {
+                        if (!_footprintCollectorLimitNotified)
+                        {
+                            _footprintCollectorLimitNotified = true;
+                            RaiseShowNotification($"{GetInstanceLabel()}: журнал кластеров достиг 256 МБ; его запись остановлена. Остальная статистика собирается.");
+                        }
+                        return;
+                    }
                     using (var writer = new StreamWriter(path, append: true))
                     {
                         if (!fileExists)
@@ -2812,6 +2935,15 @@ namespace CashReaper
 
         private bool IsTradingTimeAllowed(int bar)
         {
+            if (UseSessionHours)
+            {
+                var sessionOpen = new TimeSpan(Clamp(SessionOpenHour, 0, 23), Clamp(SessionOpenMinute, 0, 59), 0);
+                var sessionClose = new TimeSpan(Clamp(SessionCloseHour, 0, 23), Clamp(SessionCloseMinute, 0, 59), 0);
+                var current = GetRobotTime(bar).TimeOfDay;
+                if (sessionOpen == sessionClose || IsInsidePause(current, sessionClose, sessionOpen))
+                    return false;
+            }
+
             if (!TradingTimeLimitEnabled)
                 return true;
 
@@ -2845,18 +2977,95 @@ namespace CashReaper
 
         private DateTime GetRobotTime(int bar)
         {
-            var robotOffset = Math.Clamp(RobotTimeGmtOffsetHours, -12m, 14m);
-            var chartOffset = Math.Clamp(ChartTimeGmtOffsetHours, -12m, 14m);
             try
             {
                 dynamic candle = GetCandle(bar);
-                var chartTime = (DateTime)candle.Time;
-                return DateTime.SpecifyKind(chartTime, DateTimeKind.Unspecified)
-                    .AddMinutes((double)((robotOffset - chartOffset) * 60m));
+                return GetRobotTimeFromChartTime((DateTime)candle.Time);
             }
             catch
             {
+                var robotOffset = Math.Clamp(RobotTimeGmtOffsetHours, -12m, 14m);
                 return DateTime.UtcNow.AddMinutes((double)(robotOffset * 60m));
+            }
+        }
+
+        private DateTime GetRobotTimeFromChartTime(DateTime chartTime)
+        {
+            var robotOffset = Math.Clamp(RobotTimeGmtOffsetHours, -12m, 14m);
+            var chartOffset = Math.Clamp(ChartTimeGmtOffsetHours, -12m, 14m);
+            if (chartTime.Kind == DateTimeKind.Utc)
+                return DateTime.SpecifyKind(chartTime.AddMinutes((double)(robotOffset * 60m)), DateTimeKind.Unspecified);
+            return DateTime.SpecifyKind(chartTime, DateTimeKind.Unspecified)
+                .AddMinutes((double)((robotOffset - chartOffset) * 60m));
+        }
+
+        private void EnforceScheduleFromMarketEvent(MarketDataArg arg)
+        {
+            if (arg == null || CurrentBar <= 0)
+                return;
+
+            var eventTime = GetRobotTimeFromChartTime(arg.Time);
+            // Ignore backfilled historical prints when the strategy attaches to a live chart.
+            if (eventTime >= GetRobotTime(CurrentBar - 1))
+                EnforceSchedule(eventTime);
+        }
+
+        private void EnforceSchedule(DateTime robotTime)
+        {
+            // A historical candle callback must not reopen trading after a newer tick
+            // has already reached the session/pause boundary.
+            if (robotTime < _latestScheduleTime)
+                return;
+            _latestScheduleTime = robotTime;
+
+            var now = robotTime.TimeOfDay;
+            var reason = "";
+            if (UseSessionHours && CloseBeforeSessionEnd)
+            {
+                var open = new TimeSpan(Clamp(SessionOpenHour, 0, 23), Clamp(SessionOpenMinute, 0, 59), 0);
+                var close = new TimeSpan(Clamp(SessionCloseHour, 0, 23), Clamp(SessionCloseMinute, 0, 59), 0);
+                var guard = close.Subtract(TimeSpan.FromMinutes(1));
+                if (guard < TimeSpan.Zero)
+                    guard = guard.Add(TimeSpan.FromDays(1));
+                if (open == close || IsInsidePause(now, guard, open))
+                    reason = "session_close";
+            }
+
+            if (reason == "" && TradingTimeLimitEnabled && CloseBeforeTradingPause)
+            {
+                var start = new TimeSpan(Clamp(TradingPauseStartHour, 0, 23), Clamp(TradingPauseStartMinute, 0, 59), 0);
+                var end = new TimeSpan(Clamp(TradingPauseEndHour, 0, 23), Clamp(TradingPauseEndMinute, 0, 59), 0);
+                var guard = start.Subtract(TimeSpan.FromMinutes(1));
+                if (guard < TimeSpan.Zero)
+                    guard = guard.Add(TimeSpan.FromDays(1));
+                if (start != end && IsInsidePause(now, guard, end))
+                    reason = "trading_pause";
+            }
+
+            if (reason == "")
+            {
+                _scheduleClosing = false;
+                _scheduleCloseReason = "";
+                return;
+            }
+
+            _scheduleCloseReason = reason;
+            if (!_scheduleClosing)
+            {
+                _scheduleClosing = true;
+                _reversalPending = false;
+                RecordTradeEvent("schedule_boundary", Math.Max(0, CurrentBar - 1), "", false,
+                    $"reason={reason}; robot_time={robotTime:O}; position={GetActivePosition()}", 0m);
+                RaiseShowNotification($"{GetInstanceLabel()}: граница {reason}, новые входы запрещены. Закрываю позицию, если она есть.");
+            }
+
+            if (_entryOrder != null && !IsTerminalOrder(_entryOrder))
+                TryCancelOrder(_entryOrder, "schedule_entry_cancel_requested");
+
+            if (GetActivePosition() != 0 && !_emergencyClosing)
+            {
+                CancelProtectiveOrders();
+                EmergencyFlattenPosition(reason);
             }
         }
 
