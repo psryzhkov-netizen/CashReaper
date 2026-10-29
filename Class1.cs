@@ -77,6 +77,9 @@ namespace CashReaper
         [Display(GroupName = "02. Replay and diagnostics", Name = "Collect Level 2 updates", Description = "Record the initial order-book snapshot and subsequent MarketDepthChanged updates in the same ordered market-event log as trades. Use only for a short diagnostic replay first.", Order = 33)]
         public bool DepthCollectorEnabled { get; set; } = false;
 
+        [Display(GroupName = "02. Replay and diagnostics", Name = "Show CashReaper notifications", Description = "Show popup notifications from this strategy, including warnings. Does not change order handling or CSV statistics.", Order = 39)]
+        public bool ShowNotifications { get; set; } = false;
+
         [Display(GroupName = "02. Replay and diagnostics", Name = "Debug notifications", Order = 40)]
         public bool DebugMode { get; set; } = true;
 
@@ -450,7 +453,7 @@ namespace CashReaper
                     : OrderDirections.Sell;
                 _tradeState = TradeState.PositionOpen;
 
-                RaiseShowNotification(
+                ShowStrategyNotification(
                     $"{GetInstanceLabel()}: запущен. Есть открытая позиция: {GetActivePosition()}. Новые входы заблокированы до закрытия позиции.");
 
                 if (UseProtectiveOrders && RestoreProtectiveOrdersOnStart)
@@ -459,7 +462,7 @@ namespace CashReaper
 
             var context = GetTradingContextText();
 
-            RaiseShowNotification(
+            ShowStrategyNotification(
                 TradingEnabled
                     ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; ProfitTarget={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget)}; LossLimit={AccountLossLimitEnabled}/{DailyLossUnit}/{(DailyLossUnit == ProfitTargetUnit.Points ? DailyLossLimitPoints : AccountLossLimit)}; MoneySource={DailyMoneyPnlSource}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}"
                     : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; ProfitTarget={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget)}; LossLimit={AccountLossLimitEnabled}/{DailyLossUnit}/{(DailyLossUnit == ProfitTargetUnit.Points ? DailyLossLimitPoints : AccountLossLimit)}; MoneySource={DailyMoneyPnlSource}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}");
@@ -473,7 +476,7 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; absolute_delta_filter={UseAbsoluteDeltaFilter}; absolute_delta_threshold={MinimumAbsoluteDirectionalDelta}; delta_recovery_filter={UseDeltaRecoveryFilter}; delta_recovery_minimum={MinimumIntrabarDeltaRecovery}; delta_rule=directional_strictly_greater; session_hours={UseSessionHours}/{SessionOpenHour}:{SessionOpenMinute}-{SessionCloseHour}:{SessionCloseMinute}; flatten_session={CloseBeforeSessionEnd}; flatten_pause={CloseBeforeTradingPause}; chart_gmt_offset={ChartTimeGmtOffsetHours}; robot_gmt_offset={RobotTimeGmtOffsetHours}; " +
+                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; absolute_delta_filter={UseAbsoluteDeltaFilter}; absolute_delta_threshold={MinimumAbsoluteDirectionalDelta}; delta_recovery_filter={UseDeltaRecoveryFilter}; delta_recovery_minimum={MinimumIntrabarDeltaRecovery}; delta_rule=directional_strictly_greater; notifications={ShowNotifications}; session_hours={UseSessionHours}/{SessionOpenHour}:{SessionOpenMinute}-{SessionCloseHour}:{SessionCloseMinute}; flatten_session={CloseBeforeSessionEnd}; flatten_pause={CloseBeforeTradingPause}; chart_gmt_offset={ChartTimeGmtOffsetHours}; robot_gmt_offset={RobotTimeGmtOffsetHours}; " +
                 $"breakeven={BreakEvenEnabled}/{BreakEvenTriggerPoints}/{BreakEvenOffsetPoints}; trailing={TrailingMode}/{TrailingDistancePoints}; " +
                 $"reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
 
@@ -490,11 +493,11 @@ namespace CashReaper
             if (GetActivePosition() == 0)
             {
                 ResetTradeState();
-                RaiseShowNotification($"{GetInstanceLabel()}: остановлен. Позиции нет; проверьте подтверждение отмены защитных заявок в ATAS.");
+                ShowStrategyNotification($"{GetInstanceLabel()}: остановлен. Позиции нет; проверьте подтверждение отмены защитных заявок в ATAS.");
             }
             else
             {
-                RaiseShowNotification(
+                ShowStrategyNotification(
                     $"{GetInstanceLabel()}: остановлен. Внимание: позиция всё ещё открыта: {GetActivePosition()}. Отмена защитных заявок запрошена, но не подтверждена.");
             }
 
@@ -569,7 +572,7 @@ namespace CashReaper
                 {
                     _marketEventCollectorFailed = true;
                     _marketEventBuffer.Clear();
-                    RaiseShowNotification($"{GetInstanceLabel()}: запись тиков/стакана остановлена из-за ошибки: {ex.Message}. Остальная статистика собирается.");
+                    ShowStrategyNotification($"{GetInstanceLabel()}: запись тиков/стакана остановлена из-за ошибки: {ex.Message}. Остальная статистика собирается.");
                 }
             }
         }
@@ -595,7 +598,7 @@ namespace CashReaper
                     {
                         _marketEventCollectorFailed = true;
                         _marketEventBuffer.Clear();
-                        RaiseShowNotification($"{GetInstanceLabel()}: журнал тиков/стакана достиг 256 МБ; его запись остановлена. Остальная статистика собирается.");
+                        ShowStrategyNotification($"{GetInstanceLabel()}: журнал тиков/стакана достиг 256 МБ; его запись остановлена. Остальная статистика собирается.");
                         return;
                     }
                     using (var writer = new StreamWriter(path, append: true))
@@ -613,7 +616,7 @@ namespace CashReaper
             {
                 _marketEventCollectorFailed = true;
                 _marketEventBuffer.Clear();
-                RaiseShowNotification($"{GetInstanceLabel()}: запись тиков/стакана остановлена из-за ошибки: {ex.Message}. Остальная статистика собирается.");
+                ShowStrategyNotification($"{GetInstanceLabel()}: запись тиков/стакана остановлена из-за ошибки: {ex.Message}. Остальная статистика собирается.");
             }
         }
 
@@ -699,7 +702,7 @@ namespace CashReaper
                 _emergencyOrder = null;
                 _emergencyClosing = false;
                 if (order.State == OrderStates.Failed)
-                    RaiseShowNotification($"{GetInstanceLabel()}: заявка закрытия позиции отклонена ATAS. Новые входы заблокированы; закрытие будет повторено.");
+                    ShowStrategyNotification($"{GetInstanceLabel()}: заявка закрытия позиции отклонена ATAS. Новые входы заблокированы; закрытие будет повторено.");
             }
 
             SyncPositionState(_lastProcessedSignalBar, "order_changed");
@@ -874,7 +877,7 @@ namespace CashReaper
             {
                 _stopModificationPending = false;
                 _stopReplacementOrder = null;
-                RaiseShowNotification($"{GetInstanceLabel()}: перестановка стопа отклонена. Проверьте прежний стоп. {message}");
+                ShowStrategyNotification($"{GetInstanceLabel()}: перестановка стопа отклонена. Проверьте прежний стоп. {message}");
                 return;
             }
 
@@ -882,14 +885,14 @@ namespace CashReaper
             {
                 _emergencyOrder = null;
                 _emergencyClosing = false;
-                RaiseShowNotification($"{GetInstanceLabel()}: заявка закрытия позиции отклонена. Новые входы заблокированы; закрытие будет повторено. {message}");
+                ShowStrategyNotification($"{GetInstanceLabel()}: заявка закрытия позиции отклонена. Новые входы заблокированы; закрытие будет повторено. {message}");
                 return;
             }
 
             if (IsMatchingOrder(_entryOrder, order))
             {
                 ResetTradeState();
-                RaiseShowNotification(
+                ShowStrategyNotification(
                     $"{GetInstanceLabel()}: входная заявка отклонена. {message}");
                 return;
             }
@@ -906,7 +909,7 @@ namespace CashReaper
                     _stopLossOrder = null;
 
                 CancelProtectiveOrders();
-                RaiseShowNotification($"{GetInstanceLabel()}: защитная заявка отклонена. Закрываю позицию аварийно. {message}");
+                ShowStrategyNotification($"{GetInstanceLabel()}: защитная заявка отклонена. Закрываю позицию аварийно. {message}");
                 EmergencyFlattenPosition("protective_order_rejected");
                 return;
             }
@@ -917,7 +920,7 @@ namespace CashReaper
             if (IsMatchingOrder(_pendingCancelStopLossOrder, order))
                 _pendingCancelStopLossOrder = null;
 
-            RaiseShowNotification(
+            ShowStrategyNotification(
                 $"{GetInstanceLabel()}: заявка отклонена. {message}");
         }
 
@@ -1180,7 +1183,7 @@ namespace CashReaper
                 $"ProtectionMode={ProtectionCalculationMode}; " +
                 $"SeriesStep={_lossSeriesStep}";
 
-            RaiseShowNotification(message);
+            ShowStrategyNotification(message);
             RecordSignal(bar, signalName, signalCandle.Close, diff, _activeVolume, "signal");
 
             if (!TradingEnabled)
@@ -1309,14 +1312,14 @@ namespace CashReaper
                 OpenOrder(_entryOrder);
                 RecordTradeEvent("entry_order_sent", _lastProcessedSignalBar, _entryDirection.ToString(), true, "open_order_ok", _activeVolume);
 
-                RaiseShowNotification(
+                ShowStrategyNotification(
                     $"{GetInstanceLabel()}: отправлена входная заявка {direction}; Volume={_activeVolume}");
             }
             catch (Exception ex)
             {
                 RecordTradeEvent("entry_order_error", _lastProcessedSignalBar, _entryDirection.ToString(), false, ex.Message, _activeVolume);
                 ResetTradeState();
-                RaiseShowNotification(
+                ShowStrategyNotification(
                     $"{GetInstanceLabel()}: входная заявка не отправлена. Состояние сброшено. Ошибка: {ex.Message}");
             }
         }
@@ -1345,7 +1348,7 @@ namespace CashReaper
                 errors,
                 _activeVolume);
 
-            RaiseShowNotification(
+            ShowStrategyNotification(
                 $"{GetInstanceLabel()}: вход заблокирован до отправки заявки. {errors} Проверь выбранный инструмент, портфель и Replay Account.");
 
             ResetTradeState();
@@ -1382,7 +1385,7 @@ namespace CashReaper
                 _pendingEntryMacdCrossBar = -1;
             }
 
-            RaiseShowNotification(
+            ShowStrategyNotification(
                 UseProtectiveOrders
                     ? $"{GetInstanceLabel()}: вход исполнен. Position={activePosition}; TP={_takeProfitPrice}; SL={_stopLossPrice}"
                     : $"{GetInstanceLabel()}: вход исполнен. Position={activePosition}; TP/SL отключены; выход по противоположному поглощению.");
@@ -1462,7 +1465,7 @@ namespace CashReaper
                 _protectiveOrdersSent ? "tp_sl_sent" : "tp_sl_partial",
                 quantity);
 
-            RaiseShowNotification(
+            ShowStrategyNotification(
                 $"{GetInstanceLabel()}: защитные заявки выставлены. TP={_takeProfitPrice}; SL={_stopLossPrice}");
         }
 
@@ -1472,7 +1475,7 @@ namespace CashReaper
                 return;
 
             CancelProtectiveOrders();
-            RaiseShowNotification($"{GetInstanceLabel()}: защитные заявки не подтверждены. Закрываю позицию аварийно.");
+            ShowStrategyNotification($"{GetInstanceLabel()}: защитные заявки не подтверждены. Закрываю позицию аварийно.");
             EmergencyFlattenPosition("protective_order_not_sent");
         }
 
@@ -1487,7 +1490,7 @@ namespace CashReaper
             if (_entryExecutionPrice <= 0)
             {
                 _entrySentBar = -1;
-                RaiseShowNotification($"{GetInstanceLabel()}: нельзя восстановить TP/SL: ATAS не вернул фактическую среднюю цену входа. Позиция остаётся открытой без новых защитных заявок; проверьте её вручную. Новые входы заблокированы.");
+                ShowStrategyNotification($"{GetInstanceLabel()}: нельзя восстановить TP/SL: ATAS не вернул фактическую среднюю цену входа. Позиция остаётся открытой без новых защитных заявок; проверьте её вручную. Новые входы заблокированы.");
                 return;
             }
             _entryBasePrice = _entryExecutionPrice;
@@ -1498,7 +1501,7 @@ namespace CashReaper
 
             CalculateProtectionPrices(_entryExecutionPrice, _entryDirection, _activeVolume);
 
-            RaiseShowNotification(
+            ShowStrategyNotification(
                 $"{GetInstanceLabel()}: восстановление сопровождения открытой позиции. EntryPrice={_entryExecutionPrice}; TP={_takeProfitPrice}; SL={_stopLossPrice}");
 
             PlaceProtectiveOrders();
@@ -1531,7 +1534,7 @@ namespace CashReaper
                     signalBar - _lastProtectiveRetryBar < ProtectiveRetryBars)
                     return;
 
-                RaiseShowNotification(
+                ShowStrategyNotification(
                     $"{GetInstanceLabel()}: восстановление после разрыва. Позиция есть, защитные заявки проверяются заново.");
 
                 PlaceProtectiveOrders();
@@ -1540,7 +1543,7 @@ namespace CashReaper
 
             if (GetActivePosition() == 0 && _tradeState == TradeState.ProtectiveOrdersActive)
             {
-                RaiseShowNotification(
+                ShowStrategyNotification(
                     $"{GetInstanceLabel()}: позиция закрыта после восстановления связи. Состояние сброшено.");
 
                 HandleTradeClosed("unknown");
@@ -1558,7 +1561,7 @@ namespace CashReaper
                 _activeVolume);
             ResetTradeState();
 
-            RaiseShowNotification(
+            ShowStrategyNotification(
                 $"{GetInstanceLabel()}: восстановление после разрыва или отклонённой заявки. Позиции нет, состояние сброшено, новые сигналы разрешены.");
         }
 
@@ -1576,7 +1579,7 @@ namespace CashReaper
             RecordTradeClosed(outcome);
             _lastKnownPosition = GetActivePosition();
 
-            RaiseShowNotification(
+            ShowStrategyNotification(
                 $"{GetInstanceLabel()}: позиция закрыта. Outcome={outcome}; NextSeriesStep={_lossSeriesStep}");
 
             ResetTradeState();
@@ -1605,7 +1608,7 @@ namespace CashReaper
 
             RecordTradeClosed($"{outcome}_residual");
 
-            RaiseShowNotification(
+            ShowStrategyNotification(
                 $"{GetInstanceLabel()}: защитная заявка оставила лишнюю позицию. Previous={previousPosition}; Extra={activePosition}. Закрываю остаток аварийно.");
 
             _lastKnownPosition = activePosition;
@@ -1670,12 +1673,12 @@ namespace CashReaper
                     _stopModificationRequestedBar = -1;
                     if (IsTerminalOrder(_stopLossOrder))
                     {
-                        RaiseShowNotification($"{GetInstanceLabel()}: после перестановки нет подтверждённого активного стопа. Закрываю позицию.");
+                        ShowStrategyNotification($"{GetInstanceLabel()}: после перестановки нет подтверждённого активного стопа. Закрываю позицию.");
                         CancelProtectiveOrders();
                         EmergencyFlattenPosition("stop_modification_unconfirmed");
                     }
                     else
-                        RaiseShowNotification($"{GetInstanceLabel()}: перестановка стопа не подтверждена ATAS. Действует прежний стоп; проверьте заявку.");
+                        ShowStrategyNotification($"{GetInstanceLabel()}: перестановка стопа не подтверждена ATAS. Действует прежний стоп; проверьте заявку.");
                 }
                 return;
             }
@@ -1751,7 +1754,7 @@ namespace CashReaper
                 _stopReplacementOrder = null;
                 RecordTradeEvent("stop_move_error", closedBar, stopDirection.ToString(),
                     false, ex.Message, stopQuantity);
-                RaiseShowNotification($"{GetInstanceLabel()}: перестановка стопа отклонена. Старый стоп остаётся: {ex.Message}");
+                ShowStrategyNotification($"{GetInstanceLabel()}: перестановка стопа отклонена. Старый стоп остаётся: {ex.Message}");
             }
         }
 
@@ -1968,7 +1971,7 @@ namespace CashReaper
                     reason,
                     Math.Abs(activePosition));
 
-                RaiseShowNotification(reason.StartsWith("engulfing_reversal")
+                ShowStrategyNotification(reason.StartsWith("engulfing_reversal")
                     ? $"{GetInstanceLabel()}: противоположное поглощение. Закрываю текущую позицию {closeDirection}; Volume={Math.Abs(activePosition)}."
                     : reason == "account_profit_target" || reason == "account_loss_limit"
                     ? $"{GetInstanceLabel()}: дневной денежный лимит счёта достигнут. Отправлено досрочное закрытие {closeDirection}; Volume={Math.Abs(activePosition)}."
@@ -1989,7 +1992,7 @@ namespace CashReaper
                     ex.Message,
                     Math.Abs(activePosition));
 
-                RaiseShowNotification(
+                ShowStrategyNotification(
                     $"{GetInstanceLabel()}: не удалось аварийно закрыть неожиданную позицию. Ошибка: {ex.Message}");
             }
         }
@@ -2005,7 +2008,7 @@ namespace CashReaper
             catch (Exception ex)
             {
                 RecordOrderEvent(order, $"{orderName}_error", ex.Message);
-                RaiseShowNotification(
+                ShowStrategyNotification(
                     $"{GetInstanceLabel()}: не удалось отправить {orderName}. Ошибка: {ex.Message}");
 
                 return false;
@@ -2047,7 +2050,7 @@ namespace CashReaper
 
             if (_cancelRetryUntilBar >= 0 && signalBar >= _cancelRetryUntilBar)
             {
-                RaiseShowNotification($"{GetInstanceLabel()}: отмена защитной заявки не подтверждена ATAS. Новые входы заблокированы; проверьте заявки вручную.");
+                ShowStrategyNotification($"{GetInstanceLabel()}: отмена защитной заявки не подтверждена ATAS. Новые входы заблокированы; проверьте заявки вручную.");
                 _cancelRetryUntilBar = -1;
             }
 
@@ -2155,12 +2158,18 @@ namespace CashReaper
             _pendingEntryMacdCrossBar = -1;
         }
 
+        private void ShowStrategyNotification(string message)
+        {
+            if (ShowNotifications)
+                RaiseShowNotification(message);
+        }
+
         private void RaiseDebug(string message)
         {
             if (!DebugMode)
                 return;
 
-            RaiseShowNotification($"{GetInstanceLabel()}: DEBUG: {message}");
+            ShowStrategyNotification($"{GetInstanceLabel()}: DEBUG: {message}");
         }
 
         private string GetRejectReason(
@@ -2643,7 +2652,7 @@ namespace CashReaper
                         if (!_footprintCollectorLimitNotified)
                         {
                             _footprintCollectorLimitNotified = true;
-                            RaiseShowNotification($"{GetInstanceLabel()}: журнал кластеров достиг 256 МБ; его запись остановлена. Остальная статистика собирается.");
+                            ShowStrategyNotification($"{GetInstanceLabel()}: журнал кластеров достиг 256 МБ; его запись остановлена. Остальная статистика собирается.");
                         }
                         return;
                     }
@@ -2896,7 +2905,7 @@ namespace CashReaper
                     _accountLimitInvalidNotified = true;
                     RecordTradeEvent("daily_limit_invalid", bar, "", false,
                         $"{invalidReason}; profit={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(profitInPoints ? DailyProfitTargetPoints : AccountProfitTarget)}; loss={AccountLossLimitEnabled}/{DailyLossUnit}/{(lossInPoints ? DailyLossLimitPoints : AccountLossLimit)}", 0m);
-                    RaiseShowNotification($"{GetInstanceLabel()}: {invalidReason}. Новые входы заблокированы.");
+                    ShowStrategyNotification($"{GetInstanceLabel()}: {invalidReason}. Новые входы заблокированы.");
                 }
 
                 return false;
@@ -2942,7 +2951,7 @@ namespace CashReaper
             var notification = resultInPoints
                 ? $"{GetInstanceLabel()}: дневной лимит {(reason == AccountStopReason.Profit ? "прибыли" : "убытка")} достигнут: {dailyPoints} пунктов (закрытая {_dailyClosedPnlPoints}, открытая {openPoints}; лимит {limit}). Новые входы остановлены до следующего дня."
                 : $"{GetInstanceLabel()}: дневной лимит {(reason == AccountStopReason.Profit ? "прибыли" : "убытка")} достигнут: {accountPnl} {(Portfolio == null ? "" : Portfolio.Currency.ToString())} (источник {DailyMoneyPnlSource}; лимит {limit}). Новые входы остановлены до следующего дня.";
-            RaiseShowNotification(notification);
+            ShowStrategyNotification(notification);
 
             if (GetActivePosition() != 0)
                 ClosePositionForAccountLimit();
@@ -3098,7 +3107,7 @@ namespace CashReaper
                 _tradingStoppedByTime = true;
                 _lastTimeLimitNoticeDate = terminalTime.Date;
 
-                RaiseShowNotification(
+                ShowStrategyNotification(
                     $"{GetInstanceLabel()}: включена пауза торговли. RobotTime={terminalTime:HH:mm}; Pause={GetPausePeriodText()}. Новые входы запрещены.");
             }
 
@@ -3186,7 +3195,7 @@ namespace CashReaper
                 _reversalPending = false;
                 RecordTradeEvent("schedule_boundary", Math.Max(0, CurrentBar - 1), "", false,
                     $"reason={reason}; robot_time={robotTime:O}; position={GetActivePosition()}", 0m);
-                RaiseShowNotification($"{GetInstanceLabel()}: граница {reason}, новые входы запрещены. Закрываю позицию, если она есть.");
+                ShowStrategyNotification($"{GetInstanceLabel()}: граница {reason}, новые входы запрещены. Закрываю позицию, если она есть.");
             }
 
             if (_entryOrder != null && !IsTerminalOrder(_entryOrder))
