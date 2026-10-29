@@ -96,25 +96,25 @@ namespace CashReaper
         public bool TradingTimeLimitEnabled { get; set; } = false;
 
         [Display(GroupName = "04. Time filter", Name = "Close before trading pause", Description = "One minute before Pause start, cancel entries, close this strategy's position and block entries until Pause end. Requires Use trading pause.", Order = 85)]
-        public bool CloseBeforeTradingPause { get; set; } = false;
+        public bool CloseBeforeTradingPause { get; set; } = true;
 
         [Display(GroupName = "04. Time filter", Name = "Use session hours", Description = "Use the exchange session times entered below in robot time. ATAS chart candles do not provide a reliable exchange-session close schedule.", Order = 86)]
-        public bool UseSessionHours { get; set; } = false;
+        public bool UseSessionHours { get; set; } = true;
 
         [Display(GroupName = "04. Time filter", Name = "Session open hour", Order = 87)]
-        public int SessionOpenHour { get; set; } = 0;
+        public int SessionOpenHour { get; set; } = 7;
 
         [Display(GroupName = "04. Time filter", Name = "Session open minute", Order = 88)]
         public int SessionOpenMinute { get; set; } = 0;
 
         [Display(GroupName = "04. Time filter", Name = "Session close hour", Order = 89)]
-        public int SessionCloseHour { get; set; } = 23;
+        public int SessionCloseHour { get; set; } = 2;
 
         [Display(GroupName = "04. Time filter", Name = "Session close minute", Order = 90)]
-        public int SessionCloseMinute { get; set; } = 59;
+        public int SessionCloseMinute { get; set; } = 29;
 
         [Display(GroupName = "04. Time filter", Name = "Close before session end", Description = "One minute before Session close, cancel entries, flatten this strategy's position and block entries until Session open. Requires Use session hours.", Order = 91)]
-        public bool CloseBeforeSessionEnd { get; set; } = false;
+        public bool CloseBeforeSessionEnd { get; set; } = true;
 
         [Display(GroupName = "04. Time filter", Name = "Trade on Saturday", Description = "Allow new entries on Saturday in robot time. Existing positions remain protected.", Order = 81)]
         public bool TradeOnSaturday { get; set; } = false;
@@ -185,8 +185,8 @@ namespace CashReaper
         [Display(GroupName = "04. Time filter", Name = "Pause end minute", Order = 113)]
         public int TradingPauseEndMinute { get; set; } = 0;
 
-        [Display(GroupName = "07. Signal", Name = "Range size", Order = 200)]
-        public int RangeSize { get; set; } = 5;
+        [Display(GroupName = "07. Signal", Name = "Range size (CSV only)", Description = "Recorded in CSV for reference; does not change the ATAS chart. Set the chart RangeX separately in ATAS.", Order = 200)]
+        public int RangeSize { get; set; } = 6;
 
         [Display(GroupName = "07. Signal", Name = "Use MACD filter", Description = "MACD filters new entries only: long when difference > 0, short when difference < 0. An opposite body engulfing always closes the current position, even when MACD disagrees.", Order = 201)]
         public bool UseMacdFilter { get; set; } = true;
@@ -195,7 +195,7 @@ namespace CashReaper
         public decimal MinimumMacdDifferenceAbs { get; set; } = 0m;
 
         [Display(GroupName = "07. Signal", Name = "One entry per MACD difference crossing", Description = "Allow at most one filled long after difference crosses from negative to positive, and one filled short after it crosses from positive to negative. A new crossing rearms that direction.", Order = 204)]
-        public bool OneEntryPerMacdCrossing { get; set; } = true;
+        public bool OneEntryPerMacdCrossing { get; set; } = false;
 
         [Display(GroupName = "07. Signal", Name = "Use imbalance filter", Description = "Require directional diagonal footprint imbalance on the closed signal bar. If footprint data is unavailable, skip the entry.", Order = 202)]
         public bool UseImbalanceFilter { get; set; } = false;
@@ -204,16 +204,16 @@ namespace CashReaper
         public decimal MinimumImbalancePercent { get; set; } = 10000m;
 
         [Display(GroupName = "07. Signal", Name = "Use Delta % filter", Description = "Require directional Delta as a percent of bar volume strictly above the threshold. If bar volume is unavailable, skip the entry.", Order = 205)]
-        public bool UseDeltaFilter { get; set; } = false;
+        public bool UseDeltaFilter { get; set; } = true;
 
         [Display(GroupName = "07. Signal", Name = "Minimum directional Delta %", Description = "100 * Delta / Volume for long; -100 * Delta / Volume for short. Entry requires a value strictly greater than this threshold.", Order = 206)]
-        public decimal MinimumDirectionalDeltaPercent { get; set; } = 50m;
+        public decimal MinimumDirectionalDeltaPercent { get; set; } = 60m;
 
         [Display(GroupName = "07. Signal", Name = "Use absolute Delta filter", Description = "Require raw Delta on the closed signal bar to exceed the threshold for long, or fall below its negative for short. Independent of Delta % filter.", Order = 207)]
-        public bool UseAbsoluteDeltaFilter { get; set; } = false;
+        public bool UseAbsoluteDeltaFilter { get; set; } = true;
 
         [Display(GroupName = "07. Signal", Name = "Minimum absolute directional Delta", Description = "Raw contracts/volume units, not percent. Zero requires positive Delta for long and negative Delta for short. Entry requires strictly greater magnitude.", Order = 208)]
-        public decimal MinimumAbsoluteDirectionalDelta { get; set; } = 0m;
+        public decimal MinimumAbsoluteDirectionalDelta { get; set; } = 150m;
 
         [Display(GroupName = "07. Signal", Name = "Use intrabar Delta recovery filter", Description = "Track every trade in the closed signal bar. Long: (final Delta - intrabar minimum) / range; Short: (intrabar maximum - final Delta) / range. Missing trade history blocks entry. Independent of the other Delta filters.", Order = 209)]
         public bool UseDeltaRecoveryFilter { get; set; } = false;
@@ -234,16 +234,16 @@ namespace CashReaper
         public int MaxSeriesStep { get; set; } = 15;
 
         [Display(GroupName = "07. Signal", Name = "MACD fast period", Order = 210)]
-        public int FastPeriod { get; set; } = 48;
+        public int FastPeriod { get; set; } = 64;
 
         [Display(GroupName = "07. Signal", Name = "MACD slow period", Order = 220)]
-        public int SlowPeriod { get; set; } = 104;
+        public int SlowPeriod { get; set; } = 144;
 
         [Display(GroupName = "07. Signal", Name = "MACD signal period", Order = 230)]
         public int SignalPeriod { get; set; } = 36;
 
         [Display(GroupName = "01. Trading", Name = "Base volume", Order = 11)]
-        public decimal Volume { get; set; } = 2m;
+        public decimal Volume { get; set; } = 50m;
 
         [Display(GroupName = "01. Trading", Name = "Min volume", Order = 12)]
         public decimal MinVolume { get; set; } = 2m;
@@ -255,7 +255,7 @@ namespace CashReaper
         public decimal VolumeStep { get; set; } = 2m;
 
         [Display(GroupName = "08. TP/SL", Name = "Take profit points", Order = 260)]
-        public decimal TakeProfitPoints { get; set; } = 0.21m;
+        public decimal TakeProfitPoints { get; set; } = 0.22m;
 
         [Display(GroupName = "08. TP/SL", Name = "Stop loss points", Order = 270)]
         public decimal StopLossPoints { get; set; } = 0.2m;
@@ -297,7 +297,7 @@ namespace CashReaper
         public decimal PointValue { get; set; } = 1m;
 
         [Display(GroupName = "09. Commission", Name = "Commission per contract", Order = 350)]
-        public decimal CommissionPerContract { get; set; } = 0m;
+        public decimal CommissionPerContract { get; set; } = 0.45m;
 
         [Display(GroupName = "09. Commission", Name = "Commission %", Order = 360)]
         public decimal CommissionPercent { get; set; } = 0m;
