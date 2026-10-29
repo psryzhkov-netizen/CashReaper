@@ -1,4 +1,4 @@
-param([switch]$Install, [switch]$IncludeHighVolume, [switch]$CatchUp)
+﻿param([switch]$Install, [switch]$IncludeHighVolume, [switch]$CatchUp)
 
 # Read-only CashReaper -> Shtab bridge. Run once with -Install under the same
 # Windows account that runs ATAS. No trading API credentials are used.
