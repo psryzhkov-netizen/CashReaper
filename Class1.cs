@@ -69,7 +69,7 @@ namespace CashReaper
         public bool StatisticsCollectorEnabled { get; set; } = true;
 
         [Display(GroupName = "02. Replay and diagnostics", Name = "Collect signal footprints", Description = "Record Bid/Ask at every price level of an engulfing signal bar for offline imbalance analysis. Does not affect orders.", Order = 31)]
-        public bool FootprintCollectorEnabled { get; set; } = true;
+        public bool FootprintCollectorEnabled { get; set; } = false;
 
         [Display(GroupName = "02. Replay and diagnostics", Name = "Collect replay ticks", Description = "Record each OnNewTrade print for offline replay. Enable only for a diagnostic Market Replay; this can create a large CSV file.", Order = 32)]
         public bool TickCollectorEnabled { get; set; } = false;
@@ -107,10 +107,10 @@ namespace CashReaper
         [Display(GroupName = "04. Time filter", Name = "Session close hour", Order = 89)]
         public int SessionCloseHour { get; set; } = 23;
 
-        [Display(GroupName = "04. Time filter", Name = "Session close minute", Order = 89)]
+        [Display(GroupName = "04. Time filter", Name = "Session close minute", Order = 90)]
         public int SessionCloseMinute { get; set; } = 59;
 
-        [Display(GroupName = "04. Time filter", Name = "Close before session end", Description = "One minute before Session close, cancel entries, flatten this strategy's position and block entries until Session open. Requires Use session hours.", Order = 89)]
+        [Display(GroupName = "04. Time filter", Name = "Close before session end", Description = "One minute before Session close, cancel entries, flatten this strategy's position and block entries until Session open. Requires Use session hours.", Order = 91)]
         public bool CloseBeforeSessionEnd { get; set; } = false;
 
         [Display(GroupName = "04. Time filter", Name = "Trade on Saturday", Description = "Allow new entries on Saturday in robot time. Existing positions remain protected.", Order = 81)]
