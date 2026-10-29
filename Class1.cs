@@ -212,6 +212,12 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Minimum absolute directional Delta", Description = "Raw contracts/volume units, not percent. Zero requires positive Delta for long and negative Delta for short. Entry requires strictly greater magnitude.", Order = 208)]
         public decimal MinimumAbsoluteDirectionalDelta { get; set; } = 0m;
 
+        [Display(GroupName = "07. Signal", Name = "Use intrabar Delta recovery filter", Description = "Track every trade in the closed signal bar. Long: (final Delta - intrabar minimum) / range; Short: (intrabar maximum - final Delta) / range. Missing trade history blocks entry. Independent of the other Delta filters.", Order = 209)]
+        public bool UseDeltaRecoveryFilter { get; set; } = false;
+
+        [Display(GroupName = "07. Signal", Name = "Minimum intrabar Delta recovery", Description = "Fraction from 0 to 1, not raw Delta or percent. 0.05 requires the final directional Delta to recover at least 5% of its intrabar range from the worst point.", Order = 210)]
+        public decimal MinimumIntrabarDeltaRecovery { get; set; } = 0.05m;
+
         [Display(GroupName = "08. TP/SL", Name = "TP/SL mode", Order = 250)]
         public ProtectionMode ProtectionCalculationMode { get; set; } = ProtectionMode.Points;
 
@@ -383,6 +389,19 @@ namespace CashReaper
         private long _marketEventSequence;
         private bool _marketEventCollectorFailed;
         private bool _footprintCollectorLimitNotified;
+        private readonly object _deltaRecoveryLock = new object();
+        private DeltaRecoveryPath _deltaRecoveryCurrent;
+        private DeltaRecoveryPath _deltaRecoveryPrevious;
+
+        private sealed class DeltaRecoveryPath
+        {
+            public int Bar;
+            public decimal Volume;
+            public decimal Delta;
+            public decimal Minimum;
+            public decimal Maximum;
+            public bool HasUnknownDirection;
+        }
 
         public CashReaperStrategy() : base(true)
         {
@@ -391,6 +410,11 @@ namespace CashReaper
 
         protected override void OnStarted()
         {
+            lock (_deltaRecoveryLock)
+            {
+                _deltaRecoveryCurrent = null;
+                _deltaRecoveryPrevious = null;
+            }
             if (DepthCollectorEnabled)
                 CaptureDepthSnapshot();
 
@@ -449,7 +473,7 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; absolute_delta_filter={UseAbsoluteDeltaFilter}; absolute_delta_threshold={MinimumAbsoluteDirectionalDelta}; delta_rule=directional_strictly_greater; session_hours={UseSessionHours}/{SessionOpenHour}:{SessionOpenMinute}-{SessionCloseHour}:{SessionCloseMinute}; flatten_session={CloseBeforeSessionEnd}; flatten_pause={CloseBeforeTradingPause}; chart_gmt_offset={ChartTimeGmtOffsetHours}; robot_gmt_offset={RobotTimeGmtOffsetHours}; " +
+                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; absolute_delta_filter={UseAbsoluteDeltaFilter}; absolute_delta_threshold={MinimumAbsoluteDirectionalDelta}; delta_recovery_filter={UseDeltaRecoveryFilter}; delta_recovery_minimum={MinimumIntrabarDeltaRecovery}; delta_rule=directional_strictly_greater; session_hours={UseSessionHours}/{SessionOpenHour}:{SessionOpenMinute}-{SessionCloseHour}:{SessionCloseMinute}; flatten_session={CloseBeforeSessionEnd}; flatten_pause={CloseBeforeTradingPause}; chart_gmt_offset={ChartTimeGmtOffsetHours}; robot_gmt_offset={RobotTimeGmtOffsetHours}; " +
                 $"breakeven={BreakEvenEnabled}/{BreakEvenTriggerPoints}/{BreakEvenOffsetPoints}; trailing={TrailingMode}/{TrailingDistancePoints}; " +
                 $"reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
 
@@ -480,6 +504,9 @@ namespace CashReaper
         protected override void OnNewTrade(MarketDataArg arg)
         {
             EnforceScheduleFromMarketEvent(arg);
+
+            if (UseDeltaRecoveryFilter && arg != null)
+                RecordDeltaRecoveryTrade(arg);
 
             if (TickCollectorEnabled && arg != null)
                 RecordMarketEvent("trade", arg);
@@ -1054,6 +1081,11 @@ namespace CashReaper
                     RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "delta_filter");
                     return;
                 }
+                if (!PassesDeltaRecoveryFilter(bar, OrderDirections.Buy))
+                {
+                    RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "delta_recovery_filter");
+                    return;
+                }
                 if (!PassesImbalanceFilter(bar, OrderDirections.Buy))
                 {
                     RecordBarDecision(bar, current, previous, diff, engulf, "LONG", false, "imbalance_filter");
@@ -1075,6 +1107,11 @@ namespace CashReaper
                     !PassesAbsoluteDeltaFilter(bar, OrderDirections.Sell))
                 {
                     RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", false, "delta_filter");
+                    return;
+                }
+                if (!PassesDeltaRecoveryFilter(bar, OrderDirections.Sell))
+                {
+                    RecordBarDecision(bar, current, previous, diff, engulf, "SHORT", false, "delta_recovery_filter");
                     return;
                 }
                 if (!PassesImbalanceFilter(bar, OrderDirections.Sell))
@@ -1115,6 +1152,7 @@ namespace CashReaper
             if (!filtersChecked)
             {
                 if (!PassesDeltaFilter(bar, direction) || !PassesAbsoluteDeltaFilter(bar, direction) ||
+                    !PassesDeltaRecoveryFilter(bar, direction) ||
                     !PassesImbalanceFilter(bar, direction))
                     return;
             }
@@ -2360,6 +2398,98 @@ namespace CashReaper
 
             return _instanceId + ":" + bar.ToString(CultureInfo.InvariantCulture) + ":" +
                    GetCandle(bar).LastTime.Ticks.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private void RecordDeltaRecoveryTrade(MarketDataArg arg)
+        {
+            var bar = CurrentBar - 1;
+            if (bar < 0 || arg.Volume <= 0m)
+                return;
+
+            var tradeDirection = arg.Direction.ToString();
+            lock (_deltaRecoveryLock)
+            {
+                if (_deltaRecoveryCurrent == null || _deltaRecoveryCurrent.Bar != bar)
+                {
+                    _deltaRecoveryPrevious = _deltaRecoveryCurrent;
+                    _deltaRecoveryCurrent = new DeltaRecoveryPath { Bar = bar };
+                }
+
+                var path = _deltaRecoveryCurrent;
+                path.Volume += arg.Volume;
+                if (tradeDirection == "Buy")
+                    path.Delta += arg.Volume;
+                else if (tradeDirection == "Sell")
+                    path.Delta -= arg.Volume;
+                else
+                    path.HasUnknownDirection = true;
+
+                if (path.Delta < path.Minimum)
+                    path.Minimum = path.Delta;
+                if (path.Delta > path.Maximum)
+                    path.Maximum = path.Delta;
+            }
+        }
+
+        private bool PassesDeltaRecoveryFilter(int bar, OrderDirections direction)
+        {
+            if (!UseDeltaRecoveryFilter)
+                return true;
+
+            var status = "ok";
+            decimal? recovery = null;
+            decimal tickVolume = 0m;
+            decimal tickDelta = 0m;
+            decimal candleVolume = 0m;
+            decimal candleDelta = 0m;
+            try
+            {
+                if (bar < 0 || bar >= CurrentBar)
+                    status = "unavailable";
+                else
+                {
+                    var candle = GetCandle(bar);
+                    candleVolume = candle.Volume;
+                    candleDelta = candle.Delta;
+                    lock (_deltaRecoveryLock)
+                    {
+                        var path = _deltaRecoveryCurrent != null && _deltaRecoveryCurrent.Bar == bar
+                            ? _deltaRecoveryCurrent
+                            : _deltaRecoveryPrevious != null && _deltaRecoveryPrevious.Bar == bar
+                                ? _deltaRecoveryPrevious : null;
+                        if (path == null || path.Volume <= 0m)
+                            status = "no_trade_history";
+                        else
+                        {
+                            tickVolume = path.Volume;
+                            tickDelta = path.Delta;
+                            if (path.HasUnknownDirection)
+                                status = "unknown_trade_direction";
+                            else if (Math.Abs(path.Volume - candleVolume) > 0.01m ||
+                                     Math.Abs(path.Delta - candleDelta) > 0.01m)
+                                status = "incomplete_trade_history";
+                            else if (path.Maximum <= path.Minimum)
+                                status = "zero_delta_range";
+                            else
+                                recovery = direction == OrderDirections.Buy
+                                    ? (path.Delta - path.Minimum) / (path.Maximum - path.Minimum)
+                                    : (path.Maximum - path.Delta) / (path.Maximum - path.Minimum);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                status = "read_error:" + ex.GetType().Name;
+            }
+
+            if (status == "ok" && recovery.HasValue && MinimumIntrabarDeltaRecovery >= 0m &&
+                MinimumIntrabarDeltaRecovery <= 1m && recovery.Value >= MinimumIntrabarDeltaRecovery)
+                return true;
+
+            RecordTradeEvent("entry_blocked_delta_recovery", bar, direction.ToString(), false,
+                $"status={status}; recovery={recovery}; threshold={MinimumIntrabarDeltaRecovery}; tick_volume={tickVolume}; candle_volume={candleVolume}; tick_delta={tickDelta}; candle_delta={candleDelta}", 0m);
+            return false;
         }
 
         private bool PassesDeltaFilter(int bar, OrderDirections direction)
