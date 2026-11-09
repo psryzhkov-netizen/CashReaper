@@ -361,6 +361,8 @@ namespace CashReaper
         private TradeState _tradeState = TradeState.Idle;
 
         private bool _entrySent;
+        private bool _entryCancellationRequested;
+        private int _lastEntryCancelAttemptBar = -1;
         private bool _protectiveOrdersSent;
         private bool _protectivePlacementStarted;
         private bool _closingTrade;
@@ -510,8 +512,18 @@ namespace CashReaper
             if (GetActivePosition() == 0)
             {
                 CancelProtectiveOrders();
-                ResetTradeState();
-                ShowStrategyNotification($"{GetInstanceLabel()}: остановлен. Позиции нет; проверьте подтверждение отмены защитных заявок в ATAS.");
+                if (_entryOrder != null && !IsTerminalOrder(_entryOrder))
+                {
+                    TryCancelOrder(_entryOrder, "stop_entry_cancel_requested");
+                    RaiseShowNotification($"{GetInstanceLabel()}: остановлен с неподтверждённой входной заявкой. Проверьте её отмену, позицию и защитные заявки у брокера вручную.");
+                }
+                else if (_entryCancellationRequested)
+                    RaiseShowNotification($"{GetInstanceLabel()}: остановлен после тайм-аута входа. Проверьте отсутствие позднего исполнения и позицию у брокера вручную.");
+                else
+                {
+                    ResetTradeState();
+                    ShowStrategyNotification($"{GetInstanceLabel()}: остановлен. Позиции нет; проверьте подтверждение отмены защитных заявок в ATAS.");
+                }
             }
             else
             {
@@ -726,6 +738,9 @@ namespace CashReaper
 
             if (IsMatchingOrder(_entryOrder, order))
             {
+                // Preserve the ATAS-assigned ID on the tracked entry. A Done callback
+                // can arrive before its MyTrade callback (including in fast Replay).
+                _entryOrder = order;
                 if (GetActivePosition() != 0 && !_protectiveOrdersSent)
                     HandleEntryFilled();
 
@@ -943,6 +958,13 @@ namespace CashReaper
 
             if (IsMatchingOrder(_entryOrder, order))
             {
+                _entryOrder = order;
+                if (_entryCancellationRequested || GetActivePosition() != 0)
+                {
+                    BlockTradingForManualReview("входная заявка отклонена после запроса отмены или исполнения; проверьте позицию и заявки");
+                    return;
+                }
+
                 ResetTradeState();
                 ShowStrategyNotification(
                     $"{GetInstanceLabel()}: входная заявка отклонена. {message}");
@@ -983,6 +1005,8 @@ namespace CashReaper
                 return;
 
             RecordOrderEvent(order, "order_cancel_failed", message);
+            if (IsMatchingOrder(_entryOrder, order))
+                _lastEntryCancelAttemptBar = -1;
             RaiseDebug($"Не удалось отменить заявку. {message}");
         }
 
@@ -1389,9 +1413,11 @@ namespace CashReaper
             catch (Exception ex)
             {
                 RecordTradeEvent("entry_order_error", _lastProcessedSignalBar, _entryDirection.ToString(), false, ex.Message, _activeVolume);
-                ResetTradeState();
-                ShowStrategyNotification(
-                    $"{GetInstanceLabel()}: входная заявка не отправлена. Состояние сброшено. Ошибка: {ex.Message}");
+                // OpenOrder may throw after the connector accepted the request.
+                // Its final state is unknown; retain the order for a late fill.
+                _entryCancellationRequested = true;
+                BlockTradingForManualReview($"статус входной заявки неизвестен после ошибки отправки: {ex.Message}; проверьте её у брокера");
+                TryCancelOrder(_entryOrder, "entry_error_cancel_requested");
             }
         }
 
@@ -1473,13 +1499,18 @@ namespace CashReaper
                 return;
             // OnOrderChanged can be called synchronously from OpenOrder. Never create
             // another pair while the first pair is being registered.
-            if (_protectiveOrdersSent || _protectivePlacementStarted || _emergencyClosing || _safetyBlocked ||
+            // A safety halt forbids new entries, but must never suppress protection
+            // for an entry fill that arrives after the halt.
+            if (_protectiveOrdersSent || _protectivePlacementStarted || _emergencyClosing ||
                 _pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
                 return;
 
             var activePosition = GetActivePosition();
 
             if (activePosition == 0)
+                return;
+
+            if (_safetyBlocked && TradingManager?.Position?.Volume != activePosition)
                 return;
 
             _protectivePlacementStarted = true;
@@ -1597,10 +1628,14 @@ namespace CashReaper
                 signalBar > _emergencySentBar)
                 BlockTradingForManualReview("аварийная заявка завершена, но позиция не закрыта; проверьте остаток вручную");
 
-            if (_safetyBlocked)
-                return;
+            if (_entryCancellationRequested && _entryOrder != null && GetActivePosition() == 0 &&
+                !IsTerminalOrder(_entryOrder) && signalBar > _lastEntryCancelAttemptBar)
+            {
+                _lastEntryCancelAttemptBar = signalBar;
+                TryCancelOrder(_entryOrder, "entry_cancel_retry");
+            }
 
-            if (!AutoRecoveryEnabled)
+            if (_safetyBlocked || !AutoRecoveryEnabled)
                 return;
 
             if (UseProtectiveOrders && GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent)
@@ -1647,13 +1682,23 @@ namespace CashReaper
             if (signalBar - _entrySentBar < EntryRecoveryBars)
                 return;
 
-            RecordTradeEvent("entry_order_timeout", signalBar, _entryDirection.ToString(), false,
-                $"position_not_opened; order_id={_entryOrder?.Id}; order_state={_entryOrder?.State}; portfolio={Portfolio}; money_source={DailyMoneyPnlSource}",
-                _activeVolume);
-            ResetTradeState();
+            if (!_entryCancellationRequested)
+            {
+                RecordTradeEvent("entry_order_timeout", signalBar, _entryDirection.ToString(), false,
+                    $"position_not_opened; order_id={_entryOrder?.Id}; order_state={_entryOrder?.State}; portfolio={Portfolio}; money_source={DailyMoneyPnlSource}",
+                    _activeVolume);
+                _entryCancellationRequested = true;
+                if (_entryOrder != null && !IsTerminalOrder(_entryOrder))
+                {
+                    _lastEntryCancelAttemptBar = signalBar;
+                    TryCancelOrder(_entryOrder, "entry_timeout_cancel_requested");
+                }
 
-            ShowStrategyNotification(
-                $"{GetInstanceLabel()}: восстановление после разрыва или отклонённой заявки. Позиции нет, состояние сброшено, новые сигналы разрешены.");
+                // Done is ambiguous here: it may mean filled, and MyTrade can follow.
+                // Keep the entry identity even after Done; a human must verify the
+                // account before this strategy can be restarted or trade again.
+                BlockTradingForManualReview("тайм-аут входа: запросил отмену, но отсутствие позднего исполнения не подтверждено; проверьте позицию и заявку у брокера");
+            }
         }
 
         private void HandleTradeClosed(string outcome)
@@ -2089,7 +2134,7 @@ namespace CashReaper
 
         private void EmergencyFlattenPosition(string reason)
         {
-            if (_emergencyClosing || _safetyBlocked)
+            if (_emergencyClosing)
                 return;
 
             if (_pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
@@ -2100,8 +2145,13 @@ namespace CashReaper
             if (activePosition == 0)
                 return;
 
-            if (!CheckAccountStateForNewEntry())
+            // A safety halt must not prevent flattening a position owned by this
+            // strategy. Only flatten when the account agrees on the same exposure.
+            if (TradingManager?.Position?.Volume != activePosition)
+            {
+                BlockTradingForManualReview("аварийное закрытие не отправлено: позиция счёта не совпадает с позицией стратегии");
                 return;
+            }
 
             var closeDirection = activePosition > 0
                 ? OrderDirections.Sell
@@ -2297,6 +2347,8 @@ namespace CashReaper
             _entryDirection = default;
             _tradeState = TradeState.Idle;
             _entrySent = false;
+            _entryCancellationRequested = false;
+            _lastEntryCancelAttemptBar = -1;
             _protectiveOrdersSent = false;
             _protectivePlacementStarted = false;
             _closingTrade = false;
