@@ -344,6 +344,7 @@ namespace CashReaper
         private int _lastCancelRetryBar = -1;
         private int _lastAccountCloseAttemptBar = -1;
         private int _lastReversalCloseAttemptBar = -1;
+        private int _emergencySentBar = -1;
         private int _pendingReversalBar = -1;
         private OrderDirections _pendingReversalDirection;
         private bool _reversalPending;
@@ -387,6 +388,10 @@ namespace CashReaper
         private decimal _totalPnlPoints;
         private decimal _lastKnownPosition;
         private decimal _trackedPosition;
+        // ATAS can deliver the same execution more than once (including on reconnect).
+        // Keep IDs for the entire run; clearing them on a trade close would replay fills.
+        private readonly HashSet<string> _processedTradeIds = new HashSet<string>(StringComparer.Ordinal);
+        private bool _safetyBlocked;
         private int _lossSeriesStep;
         private readonly List<string> _marketEventBuffer = new List<string>(512);
         private long _marketEventSequence;
@@ -413,6 +418,14 @@ namespace CashReaper
 
         protected override void OnStarted()
         {
+            _processedTradeIds.Clear();
+            _safetyBlocked = false;
+            if (TradingManager?.MyTrades != null)
+            {
+                foreach (var oldTrade in TradingManager.MyTrades)
+                    if (oldTrade != null && !string.IsNullOrWhiteSpace(oldTrade.Id))
+                        _processedTradeIds.Add(GetTradeKey(oldTrade));
+            }
             lock (_deltaRecoveryLock)
             {
                 _deltaRecoveryCurrent = null;
@@ -437,15 +450,16 @@ namespace CashReaper
             _moneyEstimatePosition = CurrentPosition;
             _lastKnownPosition = GetActivePosition();
             _latestScheduleTime = DateTime.MinValue;
+            ResetTradeState();
+            _pendingCancelTakeProfitOrder = null;
+            _pendingCancelStopLossOrder = null;
+            _cancelRetryUntilBar = -1;
 
             if (SkipOldSignalOnStart)
                 _lastProcessedSignalBar = Math.Max(_lastProcessedSignalBar, CurrentBar - 2);
 
-            if (GetActivePosition() == 0)
-            {
-                ResetTradeState();
-            }
-            else
+            // ResetTradeState above makes orders left by a previous run unrecognized.
+            if (GetActivePosition() != 0)
             {
                 _entrySent = true;
                 _entryDirection = GetActivePosition() > 0
@@ -456,14 +470,18 @@ namespace CashReaper
                 ShowStrategyNotification(
                     $"{GetInstanceLabel()}: запущен. Есть открытая позиция: {GetActivePosition()}. Новые входы заблокированы до закрытия позиции.");
 
-                if (UseProtectiveOrders && RestoreProtectiveOrdersOnStart)
+                if (UseProtectiveOrders && RestoreProtectiveOrdersOnStart && CheckAccountStateForNewEntry())
                     RestoreProtectionForExistingPosition();
             }
+
+            // CurrentPosition is only this strategy's position. A restart resets it,
+            // while an account position or working order can remain at the broker.
+            CheckAccountStateForNewEntry();
 
             var context = GetTradingContextText();
 
             ShowStrategyNotification(
-                TradingEnabled
+                TradingEnabled && !_safetyBlocked
                     ? $"{GetInstanceLabel()}: запущен. Торговля ВКЛЮЧЕНА. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; ProfitTarget={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget)}; LossLimit={AccountLossLimitEnabled}/{DailyLossUnit}/{(DailyLossUnit == ProfitTargetUnit.Points ? DailyLossLimitPoints : AccountLossLimit)}; MoneySource={DailyMoneyPnlSource}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}"
                     : $"{GetInstanceLabel()}: запущен. Торговля выключена. Volume={Volume}; TP={TakeProfitPoints}; SL={StopLossPoints}; Recovery={AutoRecoveryEnabled}; Debug={DebugMode}; Replay={MarketReplayMode}; TimePause={TradingTimeLimitEnabled}; Saturday={TradeOnSaturday}; Sunday={TradeOnSunday}; ProfitTarget={AccountProfitTargetEnabled}/{DailyProfitUnit}/{(DailyProfitUnit == ProfitTargetUnit.Points ? DailyProfitTargetPoints : AccountProfitTarget)}; LossLimit={AccountLossLimitEnabled}/{DailyLossUnit}/{(DailyLossUnit == ProfitTargetUnit.Points ? DailyLossLimitPoints : AccountLossLimit)}; MoneySource={DailyMoneyPnlSource}; Pause={GetPausePeriodText()}; Collector={StatisticsCollectorEnabled}; {context}");
 
@@ -471,7 +489,7 @@ namespace CashReaper
                 "strategy_started",
                 Math.Max(0, CurrentBar - 1),
                 "",
-                TradingEnabled,
+                TradingEnabled && !_safetyBlocked,
                 context,
                 0m);
 
@@ -488,17 +506,19 @@ namespace CashReaper
         {
             FlushMarketEventBuffer();
             _reversalPending = false;
-            CancelProtectiveOrders();
 
             if (GetActivePosition() == 0)
             {
+                CancelProtectiveOrders();
                 ResetTradeState();
                 ShowStrategyNotification($"{GetInstanceLabel()}: остановлен. Позиции нет; проверьте подтверждение отмены защитных заявок в ATAS.");
             }
             else
             {
+                // Do not remove the only protection from a still-open broker position.
+                // ATAS resets the strategy position on stop, not the account position.
                 ShowStrategyNotification(
-                    $"{GetInstanceLabel()}: остановлен. Внимание: позиция всё ещё открыта: {GetActivePosition()}. Отмена защитных заявок запрошена, но не подтверждена.");
+                    $"{GetInstanceLabel()}: остановлен. Позиция {GetActivePosition()} остаётся открытой; проверьте её и защитные заявки у брокера вручную.");
             }
 
             base.OnStopping();
@@ -697,12 +717,9 @@ namespace CashReaper
                     order.Direction.ToString(), true, $"stop={_stopLossPrice}", order.QuantityToFill);
             }
 
-            if (IsMatchingOrder(_emergencyOrder, order) && IsTerminalOrder(order) && GetActivePosition() != 0)
+            if (IsMatchingOrder(_emergencyOrder, order) && order.State == OrderStates.Failed)
             {
-                _emergencyOrder = null;
-                _emergencyClosing = false;
-                if (order.State == OrderStates.Failed)
-                    ShowStrategyNotification($"{GetInstanceLabel()}: заявка закрытия позиции отклонена ATAS. Новые входы заблокированы; закрытие будет повторено.");
+                BlockTradingForManualReview("аварийное закрытие отклонено ATAS; проверьте позицию и заявки у брокера");
             }
 
             SyncPositionState(_lastProcessedSignalBar, "order_changed");
@@ -746,10 +763,47 @@ namespace CashReaper
             if (myTrade == null)
                 return;
 
+            if (string.IsNullOrWhiteSpace(myTrade.Id))
+            {
+                BlockTradingForManualReview("исполнение без уникального идентификатора; проверьте позицию и заявки");
+                return;
+            }
+
+            if (!_processedTradeIds.Add(GetTradeKey(myTrade)))
+            {
+                RecordTradeEvent("duplicate_my_trade_ignored", _lastProcessedSignalBar,
+                    myTrade.OrderDirection.ToString(), false, $"trade_id={myTrade.Id}; order_id={myTrade.OrderId}", myTrade.Volume);
+                return;
+            }
+
+            var ownFill = IsSameOrder(_entryOrder, myTrade) ||
+                IsSameOrder(_takeProfitOrder, myTrade) || IsSameOrder(_stopLossOrder, myTrade) ||
+                IsSameOrder(_pendingCancelTakeProfitOrder, myTrade) ||
+                IsSameOrder(_pendingCancelStopLossOrder, myTrade) ||
+                IsSameOrder(_emergencyOrder, myTrade);
+            if (!myTrade.IsNew && !ownFill)
+            {
+                RecordTradeEvent("historical_my_trade_ignored", _lastProcessedSignalBar,
+                    myTrade.OrderDirection.ToString(), false, $"trade_id={myTrade.Id}", myTrade.Volume);
+                return;
+            }
+
+            if (!ownFill)
+            {
+                RecordTradeEvent("external_my_trade_ignored", _lastProcessedSignalBar,
+                    myTrade.OrderDirection.ToString(), false, $"trade_id={myTrade.Id}; order_id={myTrade.OrderId}", myTrade.Volume);
+                BlockTradingForManualReview("получено исполнение не своей заявки; сверьте позицию и заявки у брокера");
+                return;
+            }
+
             var previousPosition = GetActivePosition();
+            // The ATAS base handler owns CurrentPosition and AveragePrice. It must be
+            // called once for each new execution, before our position-dependent logic.
+            base.OnNewMyTrade(myTrade);
+            _trackedPosition = CurrentPosition;
+
             var tradeBar = Math.Max(0, CurrentBar - 1);
             UpdateDailyPointSession(GetRobotTime(tradeBar).Date, GetCandle(tradeBar).Close, previousPosition);
-            ApplyMyTradeToTrackedPosition(myTrade);
             var activePosition = GetActivePosition();
 
             var entryFill = IsSameOrder(_entryOrder, myTrade);
@@ -883,9 +937,7 @@ namespace CashReaper
 
             if (IsMatchingOrder(_emergencyOrder, order))
             {
-                _emergencyOrder = null;
-                _emergencyClosing = false;
-                ShowStrategyNotification($"{GetInstanceLabel()}: заявка закрытия позиции отклонена. Новые входы заблокированы; закрытие будет повторено. {message}");
+                BlockTradingForManualReview($"аварийная заявка отклонена: {message}; проверьте позицию и заявки вручную");
                 return;
             }
 
@@ -909,8 +961,9 @@ namespace CashReaper
                     _stopLossOrder = null;
 
                 CancelProtectiveOrders();
-                ShowStrategyNotification($"{GetInstanceLabel()}: защитная заявка отклонена. Закрываю позицию аварийно. {message}");
+                ShowStrategyNotification($"{GetInstanceLabel()}: защитная заявка отклонена; новые входы будут заблокированы. {message}");
                 EmergencyFlattenPosition("protective_order_rejected");
+                BlockTradingForManualReview("защитная заявка отклонена; проверьте позицию и активные заявки вручную");
                 return;
             }
 
@@ -986,6 +1039,18 @@ namespace CashReaper
         private void CheckSignal(int bar)
         {
             UpdateMacdCrossingState(bar);
+
+            if (_emergencyClosing)
+            {
+                RecordBarDecision(bar, null, null, 0, false, "", false, "emergency_close_pending");
+                return;
+            }
+
+            if (!CheckAccountStateForNewEntry())
+            {
+                RecordBarDecision(bar, null, null, 0, false, "", false, "manual_safety_review_required");
+                return;
+            }
 
             if (_scheduleClosing)
             {
@@ -1204,7 +1269,7 @@ namespace CashReaper
 
         private void BeginReversal(OrderDirections direction, int bar)
         {
-            if (!TradingEnabled || _reversalPending || _emergencyClosing || _accountStopClosing)
+            if (!TradingEnabled || _safetyBlocked || _reversalPending || _emergencyClosing || _accountStopClosing)
                 return;
 
             _pendingReversalDirection = direction;
@@ -1228,7 +1293,7 @@ namespace CashReaper
 
         private void RetryReversalClose(int bar)
         {
-            if (!_reversalPending || _emergencyClosing || GetActivePosition() == 0 ||
+            if (!_reversalPending || _safetyBlocked || _emergencyClosing || GetActivePosition() == 0 ||
                 _pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null ||
                 bar <= _lastReversalCloseAttemptBar)
                 return;
@@ -1275,7 +1340,7 @@ namespace CashReaper
                 return;
             }
 
-            if (accountLimitClosing || !TradingEnabled || UseProtectiveOrders ||
+            if (accountLimitClosing || _safetyBlocked || !TradingEnabled || UseProtectiveOrders ||
                 _scheduleClosing ||
                 _pendingCancelTakeProfitOrder != null ||
                 _pendingCancelStopLossOrder != null || !CheckAccountLimits(signalBar) ||
@@ -1294,6 +1359,12 @@ namespace CashReaper
 
         private void SendEntryOrder(OrderDirections direction)
         {
+            if (_emergencyClosing || _pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
+                return;
+
+            if (!CheckAccountStateForNewEntry())
+                return;
+
             _entryOrder = new Order
             {
                 Portfolio = Portfolio,
@@ -1402,7 +1473,8 @@ namespace CashReaper
                 return;
             // OnOrderChanged can be called synchronously from OpenOrder. Never create
             // another pair while the first pair is being registered.
-            if (_protectivePlacementStarted || _emergencyClosing)
+            if (_protectiveOrdersSent || _protectivePlacementStarted || _emergencyClosing || _safetyBlocked ||
+                _pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
                 return;
 
             var activePosition = GetActivePosition();
@@ -1453,6 +1525,7 @@ namespace CashReaper
             }
 
             _protectiveOrdersSent = takeProfitSent && stopLossSent;
+            _protectivePlacementStarted = false;
             _tradeState = _protectiveOrdersSent
                 ? TradeState.ProtectiveOrdersActive
                 : TradeState.PositionOpen;
@@ -1475,8 +1548,9 @@ namespace CashReaper
                 return;
 
             CancelProtectiveOrders();
-            ShowStrategyNotification($"{GetInstanceLabel()}: защитные заявки не подтверждены. Закрываю позицию аварийно.");
+            ShowStrategyNotification($"{GetInstanceLabel()}: защитные заявки не подтверждены; новые входы будут заблокированы.");
             EmergencyFlattenPosition("protective_order_not_sent");
+            BlockTradingForManualReview("защитные заявки не подтверждены; проверьте позицию и активные заявки вручную");
         }
 
         private void RestoreProtectionForExistingPosition()
@@ -1509,6 +1583,23 @@ namespace CashReaper
 
         private void RecoverAfterConnectionGap(int signalBar)
         {
+            if (UseProtectiveOrders && _protectiveOrdersSent && GetActivePosition() != 0 &&
+                !_protectivePlacementStarted && !_emergencyClosing &&
+                signalBar - _lastProtectiveRetryBar >= Math.Max(ProtectiveRetryBars, 1) &&
+                !HasConfirmedProtection())
+            {
+                BlockTradingForManualReview("стоп и тейк не подтверждены активными заявками ATAS; проверьте позицию и заявки");
+                return;
+            }
+
+            if (_emergencyClosing && _emergencyOrder != null &&
+                _emergencyOrder.State == OrderStates.Done && GetActivePosition() != 0 &&
+                signalBar > _emergencySentBar)
+                BlockTradingForManualReview("аварийная заявка завершена, но позиция не закрыта; проверьте остаток вручную");
+
+            if (_safetyBlocked)
+                return;
+
             if (!AutoRecoveryEnabled)
                 return;
 
@@ -1834,9 +1925,87 @@ namespace CashReaper
 
         private decimal GetActivePosition()
         {
-            return CurrentPosition != 0
-                ? CurrentPosition
-                : _trackedPosition;
+            // Never resurrect a position from an old callback after ATAS reports flat.
+            return CurrentPosition;
+        }
+
+        private static string GetTradeKey(MyTrade trade)
+        {
+            return $"{trade.AccountID ?? ""}|{trade.SecurityId ?? ""}|{trade.Id}";
+        }
+
+        private void BlockTradingForManualReview(string reason)
+        {
+            if (_safetyBlocked)
+                return;
+
+            _safetyBlocked = true;
+            RecordTradeEvent("safety_blocked", _lastProcessedSignalBar, "", false, reason, Math.Abs(CurrentPosition));
+            // A safety halt requires manual action even when routine popups are disabled.
+            RaiseShowNotification($"{GetInstanceLabel()}: торговля заблокирована. {reason}");
+        }
+
+        private bool CheckAccountStateForNewEntry()
+        {
+            if (_safetyBlocked)
+                return false;
+
+            if (TradingManager == null)
+            {
+                BlockTradingForManualReview("ATAS не вернул состояние счёта; проверьте подключение");
+                return false;
+            }
+
+            var accountPosition = TradingManager.Position?.Volume ?? 0m;
+            if (accountPosition != CurrentPosition)
+            {
+                BlockTradingForManualReview($"позиция стратегии {CurrentPosition} не совпадает с позицией счёта {accountPosition}; нужна ручная сверка");
+                return false;
+            }
+
+            if (TradingManager.Orders != null)
+            {
+                foreach (var order in TradingManager.Orders)
+                {
+                    if (order != null && order.State == OrderStates.Active &&
+                        !IsMatchingOrder(_entryOrder, order) &&
+                        !IsMatchingOrder(_takeProfitOrder, order) &&
+                        !IsMatchingOrder(_stopLossOrder, order) &&
+                        !IsMatchingOrder(_pendingCancelTakeProfitOrder, order) &&
+                        !IsMatchingOrder(_pendingCancelStopLossOrder, order) &&
+                        !IsMatchingOrder(_emergencyOrder, order))
+                    {
+                        BlockTradingForManualReview("на счёте есть активная заявка вне текущей сделки стратегии; проверьте её вручную");
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private bool HasConfirmedProtection()
+        {
+            var position = CurrentPosition;
+            if (position == 0 || _takeProfitOrder == null || _stopLossOrder == null || TradingManager?.Orders == null)
+                return false;
+
+            var exitDirection = position > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+            var takeActive = false;
+            var stopActive = false;
+            foreach (var order in TradingManager.Orders)
+            {
+                if (order == null || order.State != OrderStates.Active ||
+                    order.Direction != exitDirection || order.QuantityToFill != Math.Abs(position))
+                    continue;
+
+                if (IsMatchingOrder(_takeProfitOrder, order))
+                    takeActive = true;
+                if (IsMatchingOrder(_stopLossOrder, order))
+                    stopActive = true;
+            }
+
+            return takeActive && stopActive;
         }
 
         private static bool IsPositionReversed(decimal previousPosition, decimal activePosition)
@@ -1844,18 +2013,6 @@ namespace CashReaper
             return previousPosition != 0 &&
                 activePosition != 0 &&
                 Math.Sign(previousPosition) != Math.Sign(activePosition);
-        }
-
-        private void ApplyMyTradeToTrackedPosition(MyTrade myTrade)
-        {
-            var signedVolume = myTrade.OrderDirection == OrderDirections.Buy
-                ? myTrade.Volume
-                : -myTrade.Volume;
-
-            _trackedPosition += signedVolume;
-
-            if (Math.Abs(_trackedPosition) < 0.00000001m)
-                _trackedPosition = 0;
         }
 
         private string GetTradeCloseOutcome(MyTrade myTrade)
@@ -1874,7 +2031,8 @@ namespace CashReaper
             if (order == null || myTrade == null)
                 return false;
 
-            return !string.IsNullOrEmpty(order.Id) && order.Id == myTrade.OrderId;
+            return ReferenceEquals(order, myTrade.Order) ||
+                (!string.IsNullOrEmpty(order.Id) && order.Id == myTrade.OrderId);
         }
 
         private static bool IsMatchingOrder(Order tracked, Order update)
@@ -1931,12 +2089,18 @@ namespace CashReaper
 
         private void EmergencyFlattenPosition(string reason)
         {
-            if (_emergencyClosing)
+            if (_emergencyClosing || _safetyBlocked)
+                return;
+
+            if (_pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
                 return;
 
             var activePosition = GetActivePosition();
 
             if (activePosition == 0)
+                return;
+
+            if (!CheckAccountStateForNewEntry())
                 return;
 
             var closeDirection = activePosition > 0
@@ -1954,6 +2118,7 @@ namespace CashReaper
 
             _emergencyOrder = order;
             _emergencyClosing = true;
+            _emergencySentBar = _lastProcessedSignalBar;
             _entriesBlockedUntilBar = Math.Max(_entriesBlockedUntilBar, _lastProcessedSignalBar + Math.Max(PostCloseCooldownBars, 1));
 
             try
@@ -1981,9 +2146,6 @@ namespace CashReaper
             }
             catch (Exception ex)
             {
-                _emergencyClosing = false;
-                _emergencyOrder = null;
-
                 RecordTradeEvent(
                     "emergency_flatten_error",
                     _lastProcessedSignalBar,
@@ -1994,6 +2156,7 @@ namespace CashReaper
 
                 ShowStrategyNotification(
                     $"{GetInstanceLabel()}: не удалось аварийно закрыть неожиданную позицию. Ошибка: {ex.Message}");
+                BlockTradingForManualReview("отправка аварийной заявки не подтверждена; проверьте позицию и заявки вручную");
             }
         }
 
@@ -2140,6 +2303,7 @@ namespace CashReaper
             _accountStopClosing = false;
             _tradingStoppedByTime = false;
             _emergencyClosing = false;
+            _emergencySentBar = -1;
             _entrySentBar = -1;
             _lastProtectiveRetryBar = -1;
             _lastAccountCloseAttemptBar = -1;
