@@ -108,10 +108,10 @@ namespace CashReaper
         public int SessionOpenMinute { get; set; } = 0;
 
         [Display(GroupName = "04. Time filter", Name = "Session close hour", Order = 89)]
-        public int SessionCloseHour { get; set; } = 2;
+        public int SessionCloseHour { get; set; } = 23;
 
         [Display(GroupName = "04. Time filter", Name = "Session close minute", Order = 90)]
-        public int SessionCloseMinute { get; set; } = 29;
+        public int SessionCloseMinute { get; set; } = 30;
 
         [Display(GroupName = "04. Time filter", Name = "Close before session end", Description = "One minute before Session close, cancel entries, flatten this strategy's position and block entries until Session open. Requires Use session hours.", Order = 91)]
         public bool CloseBeforeSessionEnd { get; set; } = true;
@@ -126,7 +126,7 @@ namespace CashReaper
         public decimal RobotTimeGmtOffsetHours { get; set; } = 3m;
 
         [Display(GroupName = "04. Time filter", Name = "ATAS chart GMT offset", Description = "GMT offset of candle times supplied by ATAS. Use GMT+0 for UTC candle times; set GMT+3 if the chart already uses Moscow time.", Order = 84)]
-        public decimal ChartTimeGmtOffsetHours { get; set; } = 0m;
+        public decimal ChartTimeGmtOffsetHours { get; set; } = 3m;
 
         [Display(GroupName = "05. Risk sizing", Name = "Calculate volume from risk", Description = "With TP/SL enabled, volume = reference balance x risk percentage / (stop distance x point value). Without a stop order, Base volume is used instead.", Order = 120)]
         public bool RiskSizingEnabled { get; set; } = false;
@@ -243,16 +243,16 @@ namespace CashReaper
         public int SignalPeriod { get; set; } = 36;
 
         [Display(GroupName = "01. Trading", Name = "Base volume", Order = 11)]
-        public decimal Volume { get; set; } = 50m;
+        public decimal Volume { get; set; } = 1m;
 
         [Display(GroupName = "01. Trading", Name = "Min volume", Order = 12)]
-        public decimal MinVolume { get; set; } = 2m;
+        public decimal MinVolume { get; set; } = 1m;
 
         [Display(GroupName = "01. Trading", Name = "Max volume (0 = off)", Order = 13)]
         public decimal MaxVolume { get; set; } = 0m;
 
         [Display(GroupName = "01. Trading", Name = "Volume step", Order = 14)]
-        public decimal VolumeStep { get; set; } = 2m;
+        public decimal VolumeStep { get; set; } = 1m;
 
         [Display(GroupName = "08. TP/SL", Name = "Take profit points", Order = 260)]
         public decimal TakeProfitPoints { get; set; } = 0.22m;
