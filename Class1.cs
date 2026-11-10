@@ -328,6 +328,7 @@ namespace CashReaper
         private int _pendingEntryMacdCrossBar = -1;
         private int _entrySentBar = -1;
         private int _lastProtectiveRetryBar = -1;
+        private int _protectiveExitFillPendingBar = -1;
         private DateTime _lastTimeLimitNoticeDate = DateTime.MinValue;
         private DateTime _accountStopBlockedDate = DateTime.MinValue;
         private DateTime _dailyPointDate = DateTime.MinValue;
@@ -1619,7 +1620,26 @@ namespace CashReaper
                 signalBar - _lastProtectiveRetryBar >= Math.Max(ProtectiveRetryBars, 1) &&
                 !HasConfirmedProtection())
             {
-                BlockTradingForManualReview("стоп и тейк не подтверждены активными заявками ATAS; проверьте позицию и заявки");
+                // ATAS can mark a TP/SL order Done before delivering its MyTrade.
+                // During that callback gap CurrentPosition can still be nonzero,
+                // although the exit is already executing. Give the fill one bar
+                // to arrive; a genuinely missing fill still trips the safety halt.
+                if (_takeProfitOrder?.State == OrderStates.Done ||
+                    _stopLossOrder?.State == OrderStates.Done)
+                {
+                    if (_protectiveExitFillPendingBar < 0)
+                    {
+                        _protectiveExitFillPendingBar = signalBar;
+                        RecordTradeEvent("protective_exit_fill_pending", signalBar, "", true,
+                            "защитная заявка завершена; ожидается подтверждение исполнения", Math.Abs(GetActivePosition()));
+                    }
+
+                    if (signalBar <= _protectiveExitFillPendingBar)
+                        return;
+                }
+
+                if (GetActivePosition() != 0 && !HasConfirmedProtection())
+                    BlockTradingForManualReview("стоп и тейк не подтверждены активными заявками ATAS; проверьте позицию и заявки");
                 return;
             }
 
@@ -2358,6 +2378,7 @@ namespace CashReaper
             _emergencySentBar = -1;
             _entrySentBar = -1;
             _lastProtectiveRetryBar = -1;
+            _protectiveExitFillPendingBar = -1;
             _lastAccountCloseAttemptBar = -1;
             _trackedPosition = CurrentPosition;
             _lastKnownPosition = GetActivePosition();
