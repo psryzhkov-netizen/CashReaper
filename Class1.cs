@@ -1281,7 +1281,7 @@ namespace CashReaper
             ShowStrategyNotification(message);
             // Paint only a closed bar that passed the active entry filters. A colored
             // bar is a signal, not a confirmation that the order was filled.
-            _entrySignalBars[bar] = direction == OrderDirections.Buy ? Colors.LimeGreen : Colors.Red;
+            _entrySignalBars[bar] = direction == OrderDirections.Buy ? Colors.LimeGreen : Colors.DodgerBlue;
             RecordSignal(bar, signalName, signalCandle.Close, diff, _activeVolume, "signal");
 
             if (!TradingEnabled)
