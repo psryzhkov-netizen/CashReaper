@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
 using System.IO;
+using System.Windows.Media;
 using ATAS.DataFeedsCore;
 using ATAS.Indicators;
 using ATAS.Strategies.Chart;
@@ -316,6 +317,8 @@ namespace CashReaper
         private int _finalizedSignalPeriod = -1;
 
         private readonly string _instanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
+        private readonly PaintbarsDataSeries _entrySignalBars =
+            new PaintbarsDataSeries("CashReaperEntrySignalBars", "Entry signal bars") { IsHidden = true };
 
         private int _lastProcessedSignalBar = -1;
         private int _lastExportedClosedBar = -1;
@@ -417,6 +420,8 @@ namespace CashReaper
         public CashReaperStrategy() : base(true)
         {
             Name = "CashReaper";
+            DenyToChangePanel = true;
+            DataSeries.Add(_entrySignalBars);
         }
 
         protected override void OnStarted()
@@ -1274,6 +1279,9 @@ namespace CashReaper
                 $"SeriesStep={_lossSeriesStep}";
 
             ShowStrategyNotification(message);
+            // Paint only a closed bar that passed the active entry filters. A colored
+            // bar is a signal, not a confirmation that the order was filled.
+            _entrySignalBars[bar] = direction == OrderDirections.Buy ? Colors.LimeGreen : Colors.Red;
             RecordSignal(bar, signalName, signalCandle.Close, diff, _activeVolume, "signal");
 
             if (!TradingEnabled)
