@@ -210,16 +210,19 @@ namespace CashReaper
         [Display(GroupName = "07. Signal", Name = "Minimum directional Delta %", Description = "100 * Delta / Volume for long; -100 * Delta / Volume for short. Entry requires a value strictly greater than this threshold.", Order = 206)]
         public decimal MinimumDirectionalDeltaPercent { get; set; } = 60m;
 
-        [Display(GroupName = "07. Signal", Name = "Use absolute Delta filter", Description = "Require raw Delta on the closed signal bar to exceed the threshold for long, or fall below its negative for short. Independent of Delta % filter.", Order = 207)]
+        [Display(GroupName = "07. Signal", Name = "Use absolute Delta filter", Description = "Require directional raw Delta on the closed signal bar to be above the minimum and, when set, at or below the maximum. Independent of Delta % filter.", Order = 207)]
         public bool UseAbsoluteDeltaFilter { get; set; } = true;
 
         [Display(GroupName = "07. Signal", Name = "Minimum absolute directional Delta", Description = "Raw contracts/volume units, not percent. Zero requires positive Delta for long and negative Delta for short. Entry requires strictly greater magnitude.", Order = 208)]
         public decimal MinimumAbsoluteDirectionalDelta { get; set; } = 150m;
 
-        [Display(GroupName = "07. Signal", Name = "Use intrabar Delta recovery filter", Description = "Track every trade in the closed signal bar. Long: (final Delta - intrabar minimum) / range; Short: (intrabar maximum - final Delta) / range. Missing trade history blocks entry. Independent of the other Delta filters.", Order = 209)]
+        [Display(GroupName = "07. Signal", Name = "Maximum absolute directional Delta", Description = "Raw contracts/volume units, not percent. Zero disables the upper limit; otherwise entry requires directional Delta at or below this value. Set minimum to 0 and maximum to 800 for 0 < directional Delta <= 800.", Order = 209)]
+        public decimal MaximumAbsoluteDirectionalDelta { get; set; } = 0m;
+
+        [Display(GroupName = "07. Signal", Name = "Use intrabar Delta recovery filter", Description = "Track every trade in the closed signal bar. Long: (final Delta - intrabar minimum) / range; Short: (intrabar maximum - final Delta) / range. Missing trade history blocks entry. Independent of the other Delta filters.", Order = 210)]
         public bool UseDeltaRecoveryFilter { get; set; } = false;
 
-        [Display(GroupName = "07. Signal", Name = "Minimum intrabar Delta recovery", Description = "Fraction from 0 to 1, not raw Delta or percent. 0.05 requires the final directional Delta to recover at least 5% of its intrabar range from the worst point.", Order = 210)]
+        [Display(GroupName = "07. Signal", Name = "Minimum intrabar Delta recovery", Description = "Fraction from 0 to 1, not raw Delta or percent. 0.05 requires the final directional Delta to recover at least 5% of its intrabar range from the worst point.", Order = 211)]
         public decimal MinimumIntrabarDeltaRecovery { get; set; } = 0.05m;
 
         [Display(GroupName = "08. TP/SL", Name = "TP/SL mode", Order = 250)]
@@ -502,7 +505,7 @@ namespace CashReaper
                 0m);
 
             RecordTradeEvent("signal_mode", Math.Max(0, CurrentBar - 1), "", true,
-                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; absolute_delta_filter={UseAbsoluteDeltaFilter}; absolute_delta_threshold={MinimumAbsoluteDirectionalDelta}; delta_recovery_filter={UseDeltaRecoveryFilter}; delta_recovery_minimum={MinimumIntrabarDeltaRecovery}; delta_rule=directional_strictly_greater; notifications={ShowNotifications}; session_hours={UseSessionHours}/{SessionOpenHour}:{SessionOpenMinute}-{SessionCloseHour}:{SessionCloseMinute}; flatten_session={CloseBeforeSessionEnd}; flatten_pause={CloseBeforeTradingPause}; chart_gmt_offset={ChartTimeGmtOffsetHours}; robot_gmt_offset={RobotTimeGmtOffsetHours}; " +
+                $"macd_filter={UseMacdFilter}; macd_fast={FastPeriod}; macd_slow={SlowPeriod}; macd_signal={SignalPeriod}; macd_source=Close; macd_min_abs_difference={MinimumMacdDifferenceAbs}; one_entry_per_macd_crossing={OneEntryPerMacdCrossing}; imbalance_filter={UseImbalanceFilter}; imbalance_threshold_pct={MinimumImbalancePercent}; delta_filter={UseDeltaFilter}; delta_threshold_pct={MinimumDirectionalDeltaPercent}; absolute_delta_filter={UseAbsoluteDeltaFilter}; absolute_delta_threshold={MinimumAbsoluteDirectionalDelta}; absolute_delta_maximum={MaximumAbsoluteDirectionalDelta}; delta_recovery_filter={UseDeltaRecoveryFilter}; delta_recovery_minimum={MinimumIntrabarDeltaRecovery}; delta_rule=directional_strictly_greater; notifications={ShowNotifications}; session_hours={UseSessionHours}/{SessionOpenHour}:{SessionOpenMinute}-{SessionCloseHour}:{SessionCloseMinute}; flatten_session={CloseBeforeSessionEnd}; flatten_pause={CloseBeforeTradingPause}; chart_gmt_offset={ChartTimeGmtOffsetHours}; robot_gmt_offset={RobotTimeGmtOffsetHours}; " +
                 $"breakeven={BreakEvenEnabled}/{BreakEvenTriggerPoints}/{BreakEvenOffsetPoints}; trailing={TrailingMode}/{TrailingDistancePoints}; " +
                 $"reversal_mode={!UseProtectiveOrders}; tp_sl_orders={UseProtectiveOrders}; risk_sizing={RiskSizingEnabled}; series_sizing={SeriesSizingEnabled}", 0m);
 
@@ -2820,11 +2823,13 @@ namespace CashReaper
 
             var directionalDelta = direction == OrderDirections.Buy ? delta : -delta;
             if (status == "ok" && MinimumAbsoluteDirectionalDelta >= 0m &&
-                directionalDelta > MinimumAbsoluteDirectionalDelta)
+                MaximumAbsoluteDirectionalDelta >= 0m &&
+                directionalDelta > MinimumAbsoluteDirectionalDelta &&
+                (MaximumAbsoluteDirectionalDelta == 0m || directionalDelta <= MaximumAbsoluteDirectionalDelta))
                 return true;
 
             RecordTradeEvent("entry_blocked_absolute_delta", bar, direction.ToString(), false,
-                $"status={status}; directional_delta={directionalDelta}; threshold={MinimumAbsoluteDirectionalDelta}", 0m);
+                $"status={status}; directional_delta={directionalDelta}; threshold={MinimumAbsoluteDirectionalDelta}; maximum={MaximumAbsoluteDirectionalDelta}", 0m);
             return false;
         }
 
