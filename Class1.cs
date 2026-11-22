@@ -348,7 +348,7 @@ namespace CashReaper
         private int _lastCancelRetryBar = -1;
         private int _lastAccountCloseAttemptBar = -1;
         private int _lastReversalCloseAttemptBar = -1;
-        private int _emergencySentBar = -1;
+        private int _emergencyExitFillPendingBar = -1;
         private int _pendingReversalBar = -1;
         private OrderDirections _pendingReversalDirection;
         private bool _reversalPending;
@@ -1654,9 +1654,19 @@ namespace CashReaper
             }
 
             if (_emergencyClosing && _emergencyOrder != null &&
-                _emergencyOrder.State == OrderStates.Done && GetActivePosition() != 0 &&
-                signalBar > _emergencySentBar)
-                BlockTradingForManualReview("аварийная заявка завершена, но позиция не закрыта; проверьте остаток вручную");
+                _emergencyOrder.State == OrderStates.Done && GetActivePosition() != 0)
+            {
+                // ATAS can report Done before MyTrade, including during a daily-limit
+                // close in Replay. Wait one signal bar for the position update.
+                if (_emergencyExitFillPendingBar < 0)
+                {
+                    _emergencyExitFillPendingBar = signalBar;
+                    RecordTradeEvent("emergency_exit_fill_pending", signalBar, "", true,
+                        "аварийная заявка завершена; ожидается подтверждение исполнения", Math.Abs(GetActivePosition()));
+                }
+                else if (signalBar > _emergencyExitFillPendingBar)
+                    BlockTradingForManualReview("аварийная заявка завершена, но позиция не закрыта; проверьте остаток вручную");
+            }
 
             if (_entryCancellationRequested && _entryOrder != null && GetActivePosition() == 0 &&
                 !IsTerminalOrder(_entryOrder) && signalBar > _lastEntryCancelAttemptBar)
@@ -2199,7 +2209,7 @@ namespace CashReaper
 
             _emergencyOrder = order;
             _emergencyClosing = true;
-            _emergencySentBar = _lastProcessedSignalBar;
+            _emergencyExitFillPendingBar = -1;
             _entriesBlockedUntilBar = Math.Max(_entriesBlockedUntilBar, _lastProcessedSignalBar + Math.Max(PostCloseCooldownBars, 1));
 
             try
@@ -2386,7 +2396,7 @@ namespace CashReaper
             _accountStopClosing = false;
             _tradingStoppedByTime = false;
             _emergencyClosing = false;
-            _emergencySentBar = -1;
+            _emergencyExitFillPendingBar = -1;
             _entrySentBar = -1;
             _lastProtectiveRetryBar = -1;
             _protectiveExitFillPendingBar = -1;
