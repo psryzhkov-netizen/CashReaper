@@ -766,7 +766,8 @@ namespace CashReaper
             }
 
             if (UseProtectiveOrders && GetActivePosition() != 0 && _entrySent &&
-                !_protectiveOrdersSent && _entryExecutionPrice > 0)
+                !_protectiveOrdersSent && _entryExecutionPrice > 0 &&
+                !_scheduleClosing && !_accountStopClosing && !_reversalPending && !_closingTrade)
             {
                 RaiseDebug("Позиция есть, но защитные заявки ещё не активны. Проверяю защиту.");
                 PlaceProtectiveOrders();
@@ -1511,6 +1512,7 @@ namespace CashReaper
             // A safety halt forbids new entries, but must never suppress protection
             // for an entry fill that arrives after the halt.
             if (_protectiveOrdersSent || _protectivePlacementStarted || _emergencyClosing ||
+                _scheduleClosing || _accountStopClosing || _reversalPending || _closingTrade ||
                 _pendingCancelTakeProfitOrder != null || _pendingCancelStopLossOrder != null)
                 return;
 
@@ -1666,7 +1668,8 @@ namespace CashReaper
             if (_safetyBlocked || !AutoRecoveryEnabled)
                 return;
 
-            if (UseProtectiveOrders && GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent)
+            if (UseProtectiveOrders && GetActivePosition() != 0 && _entrySent && !_protectiveOrdersSent &&
+                !_scheduleClosing && !_accountStopClosing && !_reversalPending && !_closingTrade)
             {
                 if (_entryExecutionPrice <= 0)
                 {
